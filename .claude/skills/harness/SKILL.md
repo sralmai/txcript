@@ -200,21 +200,39 @@ the Store fills it from the filename/row. Timestamp fallback: `Utc::now()`.
 
 ## Phase 5 — Wiring checklist
 
-Every item, in order; the exhaustive matches make most omissions compile
-errors:
+Every item, in order. Most omissions are compile errors, because the
+dispatch matches are exhaustive — but **three are not**, and those fail
+silently or at runtime instead. They are marked ⚠ below; check them by hand.
 
 1. `src/harness/<name>.rs` — the whole harness, one flat file, module doc
    explaining format + known losses.
 2. `src/harness/mod.rs` — `pub mod <name>;`
 3. `src/transcript.rs` — `HarnessId` variant, `ALL` array (bump its length),
    `as_str`, `FromStr` with friendly aliases.
-4. `src/bin/cli.rs` — `resume_command` default, a `discover_all` block, a
-   `load_common` arm, a `save_target` arm.
-5. `src/wasm.rs` — both dispatch matches (`parse_to_common`,
+4. `src/local.rs` — aggregate discovery and every per-harness dispatch.
+   A store whose `Ref` is neither `PathBuf` nor `String` also needs a
+   `Locator` variant, which turns items c–e into compile errors:
+   - a. `discover_with` — a `scan(…)` block (file stores) or an `ids` block.
+   - b. `Session::location()` — how the session is displayed.
+   - c. ⚠ `Session::read()` — arm falls through to `_ => Err(mismatch(…))`.
+   - d. ⚠ `Session::delete()` — same catch-all.
+   - e. ⚠ `fingerprints()` — falls through to `_ => {}`, so a missing arm
+     compiles, discovers, and reads fine while silently giving the session
+     no change cursor. The symptom is a `--cache` that never hits.
+   - f. `write_with` — the save-target arm (or an explicit `Unconvertible`
+     for a read-only source).
+   - g. `resume_command` — the default command template.
+5. `cli/src/lib.rs` — `harness()` color arm; `ensure_crop_target` if the
+   harness cannot store crops; `ensure_resumable_source` if it is pull-only;
+   a `load_direct_<name>` helper if an exact id can be fetched without
+   enumerating (see `load_direct_chatgpt`); and ⚠ the `HARNESSES` help
+   string, which is a hand-written list nothing checks (it is already
+   missing `grok_bot`).
+6. `src/wasm.rs` — both dispatch matches (`parse_to_common`,
    `render_from_common`) and the doc-comment harness list.
-6. `Cargo.toml` — feature entry if a new dep; keep it out of the `wasm` build.
-7. `README.md` — supported-harness list, string id, WASM text-format note.
-8. `tests/integration/<name>.rs` (declared in `tests/integration/main.rs`),
+7. `Cargo.toml` — feature entry if a new dep; keep it out of the `wasm` build.
+8. `README.md` — supported-harness list, string id, WASM text-format note.
+9. `tests/integration/<name>.rs` (declared in `tests/integration/main.rs`),
    a new hop in `tests/integration/cross_harness.rs`, and a new
    `assert_fixpoint` line in `tests/integration/properties.rs` — see
    `tests/README.md` for the taxonomy.
