@@ -68,7 +68,7 @@ pub mod mcp;
 mod pager;
 mod view;
 
-pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, fx, hermes, \
+pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, grok_bot, fx, hermes, \
      amp, antigravity, simple, cowork";
 
 /// The `txcript` binary's command line.
@@ -634,6 +634,20 @@ fn format_when_at(ts: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chron
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+
+    /// The help string is hand-written and drifts silently: `grok_bot` was
+    /// missing from it for several releases. Nothing else checks it.
+    #[test]
+    fn harnesses_help_string_lists_every_harness_in_order() {
+        let listed: Vec<&str> = HARNESSES
+            .strip_prefix("harnesses: ")
+            .expect("HARNESSES starts with its label")
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let expected: Vec<&str> = HarnessId::ALL.iter().map(|h| h.as_str()).collect();
+        assert_eq!(listed, expected);
+    }
 
     #[test]
     fn omitted_filters_include_every_harness_and_missing_cwd() {
