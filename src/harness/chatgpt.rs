@@ -449,7 +449,6 @@ mod remote {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::thread;
 
     use base64::Engine as _;
     use chrono::{DateTime, Utc};
@@ -903,6 +902,7 @@ mod remote {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::{Arc, Mutex};
+        use std::thread;
 
         use serde_json::json;
 

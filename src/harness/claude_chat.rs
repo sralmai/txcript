@@ -915,35 +915,38 @@ mod remote {
         build_timestamp: String,
     }
 
-    impl ClaudeChatStore {
-        /// The browser-shaped request Claude's edge expects. The cookie and
-        /// the caller's client headers are credential-bearing and marked
-        /// sensitive; the rest are ordinary browser headers whose normal
-        /// HPACK compression is part of the profile being emulated.
-        fn request(
-            &self,
-            url: String,
-            cookie: String,
-            accept: &'static str,
-            headers: Vec<(&'static str, String)>,
-            max_bytes: u64,
-        ) -> http::Request {
-            let mut sensitive = vec![("cookie", cookie)];
-            sensitive.extend(headers);
-            http::Request {
-                url,
-                headers: vec![
-                    ("accept", accept.to_string()),
-                    ("referer", "https://claude.ai/new".to_string()),
-                    ("sec-fetch-dest", String::new()),
-                    ("sec-fetch-mode", "cors".to_string()),
-                    ("sec-fetch-site", "same-origin".to_string()),
-                ],
-                sensitive,
-                max_bytes,
-            }
+    /// The browser-shaped request Claude's edge expects. The cookie and the
+    /// caller's client headers are credential-bearing and marked sensitive;
+    /// the rest are ordinary browser headers whose normal HPACK compression
+    /// is part of the profile being emulated.
+    ///
+    /// The referer is the literal public origin even when `base_url` points
+    /// at a test server: it is part of the emulated browser profile, not a
+    /// reference to where the request is going.
+    fn browser_request(
+        url: String,
+        cookie: String,
+        accept: &'static str,
+        headers: Vec<(&'static str, String)>,
+        max_bytes: u64,
+    ) -> http::Request {
+        let mut sensitive = vec![("cookie", cookie)];
+        sensitive.extend(headers);
+        http::Request {
+            url,
+            headers: vec![
+                ("accept", accept.to_string()),
+                ("referer", "https://claude.ai/new".to_string()),
+                ("sec-fetch-dest", String::new()),
+                ("sec-fetch-mode", "cors".to_string()),
+                ("sec-fetch-site", "same-origin".to_string()),
+            ],
+            sensitive,
+            max_bytes,
         }
+    }
 
+    impl ClaudeChatStore {
         /// Enumerate the selected account's Claude Chat conversations.
         ///
         /// Direct calls intentionally produce a compile-time warning because
@@ -1254,7 +1257,7 @@ mod remote {
         }
 
         fn fetch_client_metadata(&self) -> Result<ClientMetadata> {
-            let response = self.agent.get(self.request(
+            let response = self.agent.get(browser_request(
                 format!("{}/new", self.base_url),
                 self.cookie_header(),
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1284,7 +1287,7 @@ mod remote {
 
         fn get_json_with_cookie(&self, path: &str, cookie: String) -> Result<Value> {
             let url = format!("{}{path}", self.base_url);
-            let response = self.agent.get(self.request(
+            let response = self.agent.get(browser_request(
                 url,
                 cookie,
                 "application/json",
@@ -1394,7 +1397,7 @@ mod remote {
             );
             let response = self
                 .agent
-                .get(self.request(
+                .get(browser_request(
                     url,
                     self.cookie_header(),
                     "application/octet-stream,*/*;q=0.8",
@@ -1443,7 +1446,7 @@ mod remote {
             };
             let response = self
                 .agent
-                .get(self.request(
+                .get(browser_request(
                     url,
                     self.cookie_header(),
                     "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",

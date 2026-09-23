@@ -1,6 +1,6 @@
 //! Shared browser-profile HTTP transport for the live remote stores.
 //!
-//! Claude Chat and ChatGPT both read private web endpoints that sit behind
+//! Claude Chat and `ChatGPT` both read private web endpoints that sit behind
 //! an edge which inspects TLS, HTTP/2, and header shape. Both therefore need
 //! the same thing: a `wreq` client built with a browser emulation profile,
 //! driven from a dedicated thread that owns a current-thread Tokio runtime,
