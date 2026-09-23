@@ -843,18 +843,16 @@ fn read_only_error() -> Error {
 #[cfg(feature = "claude_chat")]
 mod remote {
     use std::collections::HashMap;
-    use std::sync::{OnceLock, mpsc};
-    use std::thread;
-    use std::time::Duration;
+    use std::sync::OnceLock;
 
     use base64::Engine;
     use chrono::{DateTime, Utc};
-    use futures_util::StreamExt;
     use serde_json::Value;
     use uuid::Uuid;
 
     use super::{ClaudeChat, Conversation, meta_from_conversation, read_only_error};
     use crate::error::{Error, Result};
+    use crate::http;
     use crate::transcript::{Discovered, Harness, Saved, Store, Transcript};
 
     const CLAUDE_BASE_URL: &str = "https://claude.ai";
@@ -905,7 +903,7 @@ mod remote {
         credentials: Credentials,
         active_organization_uuid: Option<String>,
         organization_uuid: Option<String>,
-        agent: BrowserTransport,
+        agent: http::Agent,
         client_metadata: OnceLock<Option<ClientMetadata>>,
         base_url: String,
     }
@@ -917,187 +915,35 @@ mod remote {
         build_timestamp: String,
     }
 
-    struct BrowserTransport {
-        sender: mpsc::Sender<BrowserRequest>,
-    }
-
-    struct BrowserRequest {
+    /// The browser-shaped request Claude's edge expects. The cookie and the
+    /// caller's client headers are credential-bearing and marked sensitive;
+    /// the rest are ordinary browser headers whose normal HPACK compression
+    /// is part of the profile being emulated.
+    ///
+    /// The referer is the literal public origin even when `base_url` points
+    /// at a test server: it is part of the emulated browser profile, not a
+    /// reference to where the request is going.
+    fn browser_request(
         url: String,
         cookie: String,
         accept: &'static str,
         headers: Vec<(&'static str, String)>,
         max_bytes: u64,
-        reply: mpsc::SyncSender<std::result::Result<BrowserResponse, String>>,
-    }
-
-    struct BrowserResponse {
-        status: u16,
-        content_type: Option<String>,
-        cf_mitigated: bool,
-        body: Vec<u8>,
-    }
-
-    impl BrowserTransport {
-        fn start() -> Result<Self> {
-            let (sender, receiver) = mpsc::channel::<BrowserRequest>();
-            let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-            thread::Builder::new()
-                .name("txcript-claude-chat-http".to_string())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| format!("could not start HTTP runtime: {error}"));
-                    let client = match &runtime {
-                        Ok(_) => wreq::Client::builder()
-                            // Claude Desktop currently embeds Chromium 148. Matching the
-                            // browser's TLS, HTTP/2, and header profile is required by the
-                            // edge in front of Claude's private read API.
-                            .emulation(wreq_util::Profile::Chrome148)
-                            // Never let Claude Desktop's credential-bearing
-                            // cookie follow a response to another origin.
-                            .redirect(wreq::redirect::Policy::none())
-                            .timeout(Duration::from_secs(30))
-                            .build()
-                            .map_err(|error| {
-                                format!("could not build browser HTTP client: {error}")
-                            }),
-                        Err(error) => Err(error.clone()),
-                    };
-                    let startup = match (&runtime, &client) {
-                        (Ok(_), Ok(_)) => Ok(()),
-                        (Err(error), _) | (_, Err(error)) => Err(error.clone()),
-                    };
-                    if ready_sender.send(startup).is_err() {
-                        return;
-                    }
-                    let (Ok(runtime), Ok(client)) = (runtime, client) else {
-                        return;
-                    };
-                    while let Ok(request) = receiver.recv() {
-                        let result = runtime.block_on(execute_get(&client, &request));
-                        let _ = request.reply.send(result);
-                    }
-                })
-                .map_err(|error| Error::Remote {
-                    harness: ClaudeChat::NAME,
-                    detail: format!("could not start browser HTTP worker: {error}"),
-                })?;
-            ready_receiver
-                .recv()
-                .map_err(|_| Error::Remote {
-                    harness: ClaudeChat::NAME,
-                    detail: "browser HTTP worker stopped during startup".to_string(),
-                })?
-                .map_err(|detail| Error::Remote {
-                    harness: ClaudeChat::NAME,
-                    detail,
-                })?;
-            Ok(Self { sender })
+    ) -> http::Request {
+        let mut sensitive = vec![("cookie", cookie)];
+        sensitive.extend(headers);
+        http::Request {
+            url,
+            headers: vec![
+                ("accept", accept.to_string()),
+                ("referer", "https://claude.ai/new".to_string()),
+                ("sec-fetch-dest", String::new()),
+                ("sec-fetch-mode", "cors".to_string()),
+                ("sec-fetch-site", "same-origin".to_string()),
+            ],
+            sensitive,
+            max_bytes,
         }
-
-        fn get(
-            &self,
-            url: String,
-            cookie: String,
-            accept: &'static str,
-            headers: Vec<(&'static str, String)>,
-            max_bytes: u64,
-        ) -> Result<BrowserResponse> {
-            let (reply, response) = mpsc::sync_channel(1);
-            self.sender
-                .send(BrowserRequest {
-                    url,
-                    cookie,
-                    accept,
-                    headers,
-                    max_bytes,
-                    reply,
-                })
-                .map_err(|_| Error::Remote {
-                    harness: ClaudeChat::NAME,
-                    detail: "browser HTTP worker stopped before the request".to_string(),
-                })?;
-            response
-                .recv()
-                .map_err(|_| Error::Remote {
-                    harness: ClaudeChat::NAME,
-                    detail: "browser HTTP worker stopped during the request".to_string(),
-                })?
-                .map_err(|detail| Error::Remote {
-                    harness: ClaudeChat::NAME,
-                    detail,
-                })
-        }
-    }
-
-    async fn execute_get(
-        client: &wreq::Client,
-        request: &BrowserRequest,
-    ) -> std::result::Result<BrowserResponse, String> {
-        let mut cookie = wreq::header::HeaderValue::from_str(&request.cookie)
-            .map_err(|_| "could not construct a safe Claude cookie header".to_string())?;
-        cookie.set_sensitive(true);
-        let mut builder = client
-            .get(&request.url)
-            .header(wreq::header::COOKIE, cookie)
-            .header(wreq::header::ACCEPT, request.accept)
-            .header("referer", "https://claude.ai/new")
-            .header("sec-fetch-dest", "")
-            .header("sec-fetch-mode", "cors")
-            .header("sec-fetch-site", "same-origin");
-        for (name, value) in &request.headers {
-            let mut value = wreq::header::HeaderValue::from_str(value)
-                .map_err(|_| format!("could not construct safe `{name}` header"))?;
-            value.set_sensitive(true);
-            builder = builder.header(*name, value);
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| format!("request failed: {error}"))?;
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(wreq::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(String::from);
-        let cf_mitigated = response
-            .headers()
-            .get("cf-mitigated")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("challenge"));
-        if response
-            .content_length()
-            .is_some_and(|length| length > request.max_bytes)
-        {
-            return Err(format!(
-                "Claude response exceeded the {} byte limit",
-                request.max_bytes
-            ));
-        }
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| format!("failed reading Claude response: {error}"))?;
-            let length = u64::try_from(body.len())
-                .unwrap_or(u64::MAX)
-                .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-            if length > request.max_bytes {
-                return Err(format!(
-                    "Claude response exceeded the {} byte limit",
-                    request.max_bytes
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(BrowserResponse {
-            status,
-            content_type,
-            cf_mitigated,
-            body,
-        })
     }
 
     impl ClaudeChatStore {
@@ -1218,7 +1064,7 @@ mod remote {
                 credentials,
                 active_organization_uuid,
                 organization_uuid,
-                agent: BrowserTransport::start()?,
+                agent: http::Agent::start(ClaudeChat::NAME)?,
                 client_metadata: OnceLock::new(),
                 base_url,
             })
@@ -1411,13 +1257,13 @@ mod remote {
         }
 
         fn fetch_client_metadata(&self) -> Result<ClientMetadata> {
-            let response = self.agent.get(
+            let response = self.agent.get(browser_request(
                 format!("{}/new", self.base_url),
                 self.cookie_header(),
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 self.base_request_headers(),
                 MAX_APP_SHELL_BYTES,
-            )?;
+            ))?;
             if !(200..300).contains(&response.status) {
                 return Err(remote_error(&response));
             }
@@ -1441,13 +1287,13 @@ mod remote {
 
         fn get_json_with_cookie(&self, path: &str, cookie: String) -> Result<Value> {
             let url = format!("{}{path}", self.base_url);
-            let response = self.agent.get(
+            let response = self.agent.get(browser_request(
                 url,
                 cookie,
                 "application/json",
                 self.request_headers(),
                 MAX_RESPONSE_BYTES,
-            )?;
+            ))?;
             if !(200..300).contains(&response.status) {
                 return Err(remote_error(&response));
             }
@@ -1551,13 +1397,13 @@ mod remote {
             );
             let response = self
                 .agent
-                .get(
+                .get(browser_request(
                     url,
                     self.cookie_header(),
                     "application/octet-stream,*/*;q=0.8",
                     self.request_headers(),
                     MAX_FILE_BYTES,
-                )
+                ))
                 .ok()?;
             if !(200..300).contains(&response.status) {
                 return None;
@@ -1600,13 +1446,13 @@ mod remote {
             };
             let response = self
                 .agent
-                .get(
+                .get(browser_request(
                     url,
                     self.cookie_header(),
                     "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
                     self.request_headers(),
                     MAX_IMAGE_BYTES,
-                )
+                ))
                 .ok()?;
             if !(200..300).contains(&response.status) {
                 return None;
@@ -1894,7 +1740,7 @@ mod remote {
         }
     }
 
-    fn remote_error(response: &BrowserResponse) -> Error {
+    fn remote_error(response: &http::Response) -> Error {
         let mut detail = match response.status {
             401 => {
                 "Claude rejected the Desktop session; sign in again in Claude Desktop, then retry"
@@ -1923,7 +1769,7 @@ mod remote {
         }
     }
 
-    fn safe_server_message(response: &BrowserResponse) -> Option<String> {
+    fn safe_server_message(response: &http::Response) -> Option<String> {
         let is_json = response
             .content_type
             .as_deref()

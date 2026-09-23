@@ -449,13 +449,9 @@ mod remote {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
 
     use base64::Engine as _;
     use chrono::{DateTime, Utc};
-    use futures_util::StreamExt as _;
     use serde::Deserialize;
     use serde_json::Value;
     use uuid::Uuid;
@@ -463,6 +459,7 @@ mod remote {
     use super::{ChatGpt, Conversation, meta_from_conversation, read_only_error, value_timestamp};
     use crate::error::{Error, Result};
     use crate::harness::home_dir;
+    use crate::http;
     use crate::transcript::{Discovered, Harness, Saved, Store, Transcript};
 
     const CHATGPT_BASE_URL: &str = "https://chatgpt.com";
@@ -510,7 +507,7 @@ mod remote {
     /// Read-only client for `ChatGPT`'s live web conversation store.
     pub struct ChatGptStore {
         credentials: Credentials,
-        agent: BrowserTransport,
+        agent: http::Agent,
         base_url: String,
     }
 
@@ -566,7 +563,7 @@ mod remote {
             validate_header("account id", &credentials.account_id)?;
             Ok(Self {
                 credentials,
-                agent: BrowserTransport::start()?,
+                agent: http::Agent::start(ChatGpt::NAME)?,
                 base_url,
             })
         }
@@ -582,9 +579,15 @@ mod remote {
         }
 
         fn get_json(&self, path: &str) -> Result<Value> {
-            let response = self.agent.request(BrowserRequestSpec {
+            let response = self.agent.get(http::Request {
                 url: format!("{}{path}", self.base_url),
-                headers: self.headers(),
+                headers: vec![
+                    ("accept", "application/json".to_string()),
+                    ("originator", "txcript".to_string()),
+                    ("sec-fetch-mode", "cors".to_string()),
+                    ("referer", "https://chatgpt.com/".to_string()),
+                ],
+                sensitive: self.headers(),
                 max_bytes: MAX_RESPONSE_BYTES,
             })?;
             response_json(&response)
@@ -728,132 +731,7 @@ mod remote {
         }
     }
 
-    struct BrowserTransport {
-        sender: mpsc::Sender<BrowserRequest>,
-    }
-
-    struct BrowserRequest {
-        spec: BrowserRequestSpec,
-        reply: mpsc::SyncSender<std::result::Result<BrowserResponse, String>>,
-    }
-
-    struct BrowserRequestSpec {
-        url: String,
-        headers: Vec<(&'static str, String)>,
-        max_bytes: u64,
-    }
-
-    struct BrowserResponse {
-        status: u16,
-        body: Vec<u8>,
-    }
-
-    impl BrowserTransport {
-        fn start() -> Result<Self> {
-            let (sender, receiver) = mpsc::channel::<BrowserRequest>();
-            let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-            thread::Builder::new()
-                .name("txcript-chatgpt-http".to_string())
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| format!("could not start HTTP runtime: {error}"));
-                    let client = runtime.as_ref().map_err(Clone::clone).and_then(|_| {
-                        wreq::Client::builder()
-                            .emulation(wreq_util::Profile::Chrome148)
-                            .redirect(wreq::redirect::Policy::none())
-                            .timeout(Duration::from_secs(30))
-                            .build()
-                            .map_err(|error| {
-                                format!("could not build browser HTTP client: {error}")
-                            })
-                    });
-                    let startup = match (&runtime, &client) {
-                        (Ok(_), Ok(_)) => Ok(()),
-                        (Err(error), _) | (_, Err(error)) => Err(error.clone()),
-                    };
-                    if ready_sender.send(startup).is_err() {
-                        return;
-                    }
-                    let (Ok(runtime), Ok(client)) = (runtime, client) else {
-                        return;
-                    };
-                    while let Ok(request) = receiver.recv() {
-                        let result = runtime.block_on(execute(&client, &request.spec));
-                        let _ = request.reply.send(result);
-                    }
-                })
-                .map_err(|error| {
-                    protocol_error(&format!("could not start HTTP worker: {error}"))
-                })?;
-            ready_receiver
-                .recv()
-                .map_err(|_| protocol_error("HTTP worker stopped during startup"))?
-                .map_err(|detail| protocol_error(&detail))?;
-            Ok(Self { sender })
-        }
-
-        fn request(&self, spec: BrowserRequestSpec) -> Result<BrowserResponse> {
-            let (reply, response) = mpsc::sync_channel(1);
-            self.sender
-                .send(BrowserRequest { spec, reply })
-                .map_err(|_| protocol_error("HTTP worker stopped before the request"))?;
-            response
-                .recv()
-                .map_err(|_| protocol_error("HTTP worker stopped during the request"))?
-                .map_err(|detail| protocol_error(&detail))
-        }
-    }
-
-    async fn execute(
-        client: &wreq::Client,
-        spec: &BrowserRequestSpec,
-    ) -> std::result::Result<BrowserResponse, String> {
-        let mut builder = client
-            .get(&spec.url)
-            .header(wreq::header::ACCEPT, "application/json")
-            .header("originator", "txcript")
-            .header("sec-fetch-mode", "cors")
-            .header("referer", "https://chatgpt.com/");
-        for (name, value) in &spec.headers {
-            let mut header = wreq::header::HeaderValue::from_str(value)
-                .map_err(|_| format!("could not construct safe `{name}` header"))?;
-            header.set_sensitive(true);
-            builder = builder.header(*name, header);
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| format!("request failed: {error}"))?;
-        let status = response.status().as_u16();
-        if response
-            .content_length()
-            .is_some_and(|length| length > spec.max_bytes)
-        {
-            return Err(format!(
-                "response exceeded the {} byte limit",
-                spec.max_bytes
-            ));
-        }
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| format!("failed reading response: {error}"))?;
-            if body.len().saturating_add(chunk.len())
-                > usize::try_from(spec.max_bytes).unwrap_or(usize::MAX)
-            {
-                return Err(format!(
-                    "response exceeded the {} byte limit",
-                    spec.max_bytes
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(BrowserResponse { status, body })
-    }
-
-    fn response_json(response: &BrowserResponse) -> Result<Value> {
+    fn response_json(response: &http::Response) -> Result<Value> {
         if !(200..300).contains(&response.status) {
             let message = serde_json::from_slice::<Value>(&response.body)
                 .ok()
@@ -1024,6 +902,7 @@ mod remote {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::{Arc, Mutex};
+        use std::thread;
 
         use serde_json::json;
 
