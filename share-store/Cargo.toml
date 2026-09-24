@@ -1,0 +1,23 @@
+[package]
+name = "txcript-share-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Object store and catalog seams for txcript's shared transcript service."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+# Only the sans-IO core, for `Key`/`KeyPrefix`/`Precondition`. No S3 client,
+# no HTTP, no async runtime: the real backends are hosts' business, and this
+# crate defines the shape they must fit.
+txcript-share-core = { path = "../share-core" }
+
+[dev-dependencies]
+# A runtime, only to drive the conformance suite. Current-thread is enough
+# and matches the Worker's execution model.
+tokio = { version = "1.52.3", default-features = false, features = ["rt", "macros"] }
+tempfile = "3.27.0"
+
+[lints]
+workspace = true
