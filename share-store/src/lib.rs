@@ -107,6 +107,14 @@ impl Attrs {
         self.0.get(name).map(String::as_str)
     }
 
+    /// A copy without `name`. Used by backends that persist bookkeeping
+    /// alongside caller attributes and must not hand it back.
+    #[must_use]
+    pub fn without(mut self, name: &str) -> Self {
+        self.0.remove(name);
+        self
+    }
+
     #[must_use]
     pub fn byte_len(&self) -> usize {
         self.0.iter().map(|(k, v)| k.len() + v.len()).sum()

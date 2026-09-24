@@ -46,19 +46,16 @@ use core::fmt;
 pub struct PrincipalId(String);
 
 impl PrincipalId {
-    /// Wrap a value the caller guarantees is already injective and safe as
-    /// one path segment.
+    /// Wrap a value the caller guarantees is injective.
     ///
-    /// Rejects the empty string and anything containing `/`, which would
-    /// let an identity forge a key prefix and so impersonate another owner.
+    /// Must be a single plain segment: an owner that could be `..`, or could
+    /// contain a separator, would let one identity address another's keys.
+    /// This is the same rule [`Key`] applies to a session, deliberately —
+    /// one rule, checked in one place.
     #[must_use]
     pub fn new(value: impl Into<String>) -> Option<Self> {
         let value = value.into();
-        let usable = !value.is_empty()
-            && value.len() <= 128
-            && !value.contains('/')
-            && !value.chars().any(char::is_control);
-        usable.then_some(Self(value))
+        plain_segment(&value).then_some(Self(value))
     }
 
     #[must_use]
@@ -125,8 +122,8 @@ pub struct Key {
 impl Key {
     /// Build the key a principal's session lives at.
     ///
-    /// `None` when `session` is not a single plain segment — no separators,
-    /// no `.`/`..`, no control characters, non-empty.
+    /// `None` when `session` is not a single plain segment. The owner needs
+    /// no check here: [`PrincipalId`] cannot hold anything else.
     #[must_use]
     pub fn new(owner: PrincipalId, session: &str) -> Option<Self> {
         plain_segment(session).then(|| Self {
@@ -195,9 +192,13 @@ impl KeyPrefix {
     }
 }
 
-/// One plain path segment: non-empty, no separators, no relative names, no
-/// control characters, bounded length.
-fn plain_segment(value: &str) -> bool {
+/// The single rule for anything that becomes a path segment: non-empty, no
+/// separators, no relative names, no control characters, bounded length.
+///
+/// Both halves of a [`Key`] must satisfy it. Applying it in one place is what
+/// stops one half drifting: an earlier version validated the session here and
+/// the owner separately, and the owner copy was missing the `..` case.
+pub(crate) fn plain_segment(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value != "."
@@ -215,9 +216,18 @@ mod tests {
     }
 
     #[test]
-    fn principal_ids_reject_values_that_could_forge_a_prefix() {
+    fn principal_ids_reject_anything_that_could_address_another_owner() {
         assert!(PrincipalId::new("abc123").is_some());
-        for bad in ["", "a/b", "a\u{0}b", &"x".repeat(129)] {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a:b",
+            "a\u{0}b",
+            &"x".repeat(129),
+        ] {
             assert!(PrincipalId::new(bad).is_none(), "{bad:?} must be rejected");
         }
     }
@@ -230,7 +240,9 @@ mod tests {
 
     #[test]
     fn key_parsing_rejects_traversal_and_extra_segments() {
-        for bad in ["..", "a/../b", "a/b/c", "/abs", "a/", "", "a//b", "a/."] {
+        for bad in [
+            "..", "a/../b", "a/b/c", "/abs", "a/", "", "a//b", "a/.", "../x",
+        ] {
             assert!(Key::parse(bad).is_none(), "{bad:?} must be rejected");
         }
     }
@@ -239,5 +251,30 @@ mod tests {
     fn list_prefixes_render_for_a_store() {
         assert_eq!(KeyPrefix::everything().as_store_prefix(), "");
         assert_eq!(KeyPrefix::owned_by(id("bob")).as_store_prefix(), "bob/");
+    }
+
+    proptest::proptest! {
+        /// No principal id, however constructed, can produce a slug that
+        /// escapes its own prefix or parses as a different owner.
+        #[test]
+        fn a_key_never_escapes_its_owners_prefix(owner in ".*", session in ".*") {
+            let Some(owner) = PrincipalId::new(owner) else { return Ok(()) };
+            let Some(key) = Key::new(owner.clone(), &session) else { return Ok(()) };
+            let slug = key.to_slug();
+            let prefix = format!("{owner}/");
+            proptest::prop_assert!(slug.starts_with(&prefix));
+            proptest::prop_assert_eq!(slug.matches('/').count(), 1);
+            let parsed = Key::parse(&slug);
+            proptest::prop_assert_eq!(parsed.as_ref(), Some(&key));
+        }
+
+        /// Parsing is total: no input panics, and anything that parses
+        /// renders back to itself.
+        #[test]
+        fn key_parsing_is_total_and_round_trips(slug in ".*") {
+            if let Some(key) = Key::parse(&slug) {
+                proptest::prop_assert_eq!(key.to_slug(), slug);
+            }
+        }
     }
 }

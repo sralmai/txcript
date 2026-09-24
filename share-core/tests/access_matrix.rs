@@ -13,9 +13,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use txcript_share_core::identity::{ForwardedClientCert, Headers, Identity, StaticTokens};
-use txcript_share_core::plan::{ObjectFacts, Plan, Request, Status, decide};
+use txcript_share_core::plan::{ObjectFacts, Plan, Precondition, Request, Status, decide};
 use txcript_share_core::policy::{
-    AllowAll, ListScope, OwnerPrefix, Policy, ReadOnlyMirror, TeamScoped,
+    AllowAll, ListPlan, ListScope, OwnerPrefix, Policy, ReadOnlyMirror, TeamScoped,
 };
 use txcript_share_core::{Key, KeyPrefix, Principal, PrincipalId, PrincipalKind};
 
@@ -220,15 +220,70 @@ fn listing_scope_follows_the_policy() {
         if name != "AllowAll" {
             assert_eq!(
                 mine,
-                Plan::ListPrefix(own.clone()),
+                Plan::List(ListPlan::prefix_is_enough(own.clone())),
                 "{name}: `mine` must scope to the caller"
             );
         }
+        // A policy that cannot express its read rule as a prefix must say
+        // so, or the host lists keys the policy would have denied.
+        let expected = if name == "TeamScoped" {
+            ListPlan::filtered(KeyPrefix::everything())
+        } else {
+            ListPlan::prefix_is_enough(KeyPrefix::everything())
+        };
         assert_eq!(
             everyone,
-            Plan::ListPrefix(KeyPrefix::everything()),
-            "{name}: `everyone` must not be silently narrowed"
+            Plan::List(expected),
+            "{name}: `everyone` must carry the right filter requirement"
         );
+    }
+}
+
+/// A policy whose read rule is not a prefix must demand per-entry
+/// authorization; otherwise a conforming host — which executes a `Plan`
+/// verbatim — returns keys and titles the policy would deny on read.
+#[test]
+fn a_policy_that_cannot_express_itself_as_a_prefix_demands_filtering() {
+    let alice = principal("alice");
+    let policy = TeamScoped::new()
+        .with(PrincipalId::new("alice").expect("id"), "red")
+        .with(PrincipalId::new("bob").expect("id"), "blue");
+    let plan = decide(
+        &Request::List {
+            scope: ListScope::Everyone,
+        },
+        &alice,
+        None,
+        &policy,
+    );
+    match plan {
+        Plan::List(list) => assert!(
+            list.authorize_each,
+            "a team-scoped listing must be filtered, not trusted to its prefix"
+        ),
+        other => panic!("expected a listing, got {other:?}"),
+    }
+}
+
+/// A create is conditional: the policy authorized `Publish` against an
+/// absent object, and an unconditional write would destroy a transcript
+/// another caller created in the meantime.
+#[test]
+fn publishing_onto_nothing_is_conditional_on_it_still_being_nothing() {
+    let plan = decide(
+        &Request::Publish {
+            session: "sess-1".into(),
+            if_match: None,
+        },
+        &principal("alice"),
+        None,
+        &OwnerPrefix,
+    );
+    match plan {
+        Plan::WriteObject { precondition, .. } => {
+            assert_eq!(precondition, Precondition::IfAbsent);
+        }
+        other => panic!("expected a write, got {other:?}"),
     }
 }
 
@@ -260,11 +315,12 @@ fn every_identity_double_satisfies_the_shared_conformance_suite() {
         ),
     );
     conformance::absent_credential_is_none(&tokens);
-    conformance::malformed_credential_is_none(&tokens, "x-token");
+    conformance::malformed_credential_is_not_an_outage(&tokens, "x-token");
+    conformance::unknown_credential_is_none(&tokens, "x-token", "not-a-real-token");
 
     let certs = ForwardedClientCert::new("x-client-subject");
     conformance::absent_credential_is_none(&certs);
-    conformance::malformed_credential_is_none(&certs, "x-client-subject");
+    conformance::malformed_credential_is_not_an_outage(&certs, "x-client-subject");
     conformance::ids_are_injective(
         &certs,
         "x-client-subject",

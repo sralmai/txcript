@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9396dc3aab559b5560a46a87d20e62ab77878d578fefff699da05686b83de7b2 # shrinks to owner = "\u{b}", session = "a"

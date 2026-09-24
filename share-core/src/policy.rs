@@ -73,12 +73,47 @@ pub enum ListScope {
     Everyone,
 }
 
+/// How a listing must be executed.
+///
+/// A prefix alone is not always enough. [`TeamScoped`] admits objects by
+/// their stored team, which no prefix describes, so it demands that the host
+/// check each entry. Making that a value the host must handle — rather than
+/// a prefix it can quietly trust — is what stops a policy silently leaking
+/// every key it cannot express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPlan {
+    pub prefix: KeyPrefix,
+    /// When set, the host must call [`Policy::authorize`] with
+    /// [`Action::Read`] on every entry and drop those denied.
+    pub authorize_each: bool,
+}
+
+impl ListPlan {
+    /// The prefix fully describes what may be seen.
+    #[must_use]
+    pub fn prefix_is_enough(prefix: KeyPrefix) -> Self {
+        Self {
+            prefix,
+            authorize_each: false,
+        }
+    }
+
+    /// The prefix narrows the scan; the policy decides each entry.
+    #[must_use]
+    pub fn filtered(prefix: KeyPrefix) -> Self {
+        Self {
+            prefix,
+            authorize_each: true,
+        }
+    }
+}
+
 pub trait Policy: Send + Sync {
     fn authorize(&self, who: &Principal, action: Action, target: &Target) -> Decision;
 
-    /// The prefix a listing must be restricted to. Returning a narrower
-    /// prefix than asked for is how a policy scopes discovery.
-    fn list_scope(&self, who: &Principal, scope: ListScope) -> KeyPrefix;
+    /// How a listing must be scoped and, where a prefix is insufficient,
+    /// filtered.
+    fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan;
 }
 
 /// Read anyone's, write only your own. The shipped policy.
@@ -99,11 +134,11 @@ impl Policy for OwnerPrefix {
         }
     }
 
-    fn list_scope(&self, who: &Principal, scope: ListScope) -> KeyPrefix {
-        match scope {
+    fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan {
+        ListPlan::prefix_is_enough(match scope {
             ListScope::Mine => KeyPrefix::owned_by(who.id.clone()),
             ListScope::Everyone => KeyPrefix::everything(),
-        }
+        })
     }
 }
 
@@ -125,11 +160,11 @@ impl Policy for ReadOnlyMirror {
         }
     }
 
-    fn list_scope(&self, who: &Principal, scope: ListScope) -> KeyPrefix {
-        match scope {
+    fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan {
+        ListPlan::prefix_is_enough(match scope {
             ListScope::Mine => KeyPrefix::owned_by(who.id.clone()),
             ListScope::Everyone => KeyPrefix::everything(),
-        }
+        })
     }
 }
 
@@ -196,18 +231,14 @@ impl Policy for TeamScoped {
         }
     }
 
-    fn list_scope(&self, who: &Principal, scope: ListScope) -> KeyPrefix {
+    fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan {
         match scope {
-            // A team listing cannot be expressed as one key prefix, so the
-            // host lists broadly and filters by `authorize`. Saying so here
-            // keeps the host from assuming a prefix is always sufficient.
-            ListScope::Mine | ListScope::Everyone => {
-                if matches!(scope, ListScope::Mine) {
-                    KeyPrefix::owned_by(who.id.clone())
-                } else {
-                    KeyPrefix::everything()
-                }
-            }
+            // Own keys are fully described by a prefix.
+            ListScope::Mine => ListPlan::prefix_is_enough(KeyPrefix::owned_by(who.id.clone())),
+            // A team is not a prefix, so the scan is broad and every entry
+            // must be authorized. Returning a bare `everything` here is how
+            // an earlier version leaked every team's keys and titles.
+            ListScope::Everyone => ListPlan::filtered(KeyPrefix::everything()),
         }
     }
 }
@@ -222,7 +253,7 @@ impl Policy for AllowAll {
         Decision::Allow
     }
 
-    fn list_scope(&self, _: &Principal, _: ListScope) -> KeyPrefix {
-        KeyPrefix::everything()
+    fn list_scope(&self, _: &Principal, _: ListScope) -> ListPlan {
+        ListPlan::prefix_is_enough(KeyPrefix::everything())
     }
 }

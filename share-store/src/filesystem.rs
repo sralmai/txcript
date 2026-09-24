@@ -6,8 +6,10 @@
 //!
 //! 1. **Metadata in a listing.** `S3` LIST returns user metadata inline; a
 //!    directory returns names. Attributes therefore get a declared home — a
-//!    `.attrs` sidecar read during listing — instead of the caller silently
-//!    depending on S3 behaviour.
+//!    parallel `attrs/` tree, read during listing — instead of the caller
+//!    silently depending on S3 behaviour. A sidecar *beside* the object
+//!    would collide with a legal session name: publishing `notes` would
+//!    overwrite the transcript stored at `notes.attrs`.
 //! 2. **Versions.** There is no `ETag`, so one is derived from the content.
 //! 3. **Atomic conditional writes.** There is no compare-and-swap. See the
 //!    honesty note on [`Filesystem::put`].
@@ -23,6 +25,16 @@ use txcript_share_core::plan::Precondition;
 
 use crate::{Attrs, Cursor, Object, ObjectMeta, ObjectStore, Page, StoreError, Version};
 
+/// Object bodies.
+const OBJECTS: &str = "objects";
+/// Attributes and the stored version, one file per object.
+const ATTRS: &str = "attrs";
+/// In-flight writes, renamed into place on completion.
+const TMP: &str = "tmp";
+/// The attribute name under which the version is persisted, so `head` and
+/// `list` never have to read a body to learn it.
+const VERSION_ATTR: &str = "\u{1}version";
+
 /// Objects as files under a root, one directory per owner.
 #[derive(Debug, Clone)]
 pub struct Filesystem {
@@ -35,16 +47,24 @@ impl Filesystem {
         Self { root: root.into() }
     }
 
-    /// `<root>/<owner>/<session>`. `Key` has already guaranteed both
-    /// segments are plain, so this cannot escape the root.
+    /// `<root>/objects/<owner>/<session>`. `Key` guarantees both segments
+    /// are plain, so this cannot escape the root.
     fn path_of(&self, key: &Key) -> PathBuf {
-        self.root.join(key.owner().as_str()).join(key.session())
+        self.tree(OBJECTS, key)
     }
 
+    /// `<root>/attrs/<owner>/<session>`. A parallel tree rather than a
+    /// suffix beside the object: `notes.attrs` is a legal session name, and
+    /// a suffix scheme would let publishing `notes` destroy it.
     fn attrs_path_of(&self, key: &Key) -> PathBuf {
+        self.tree(ATTRS, key)
+    }
+
+    fn tree(&self, tree: &str, key: &Key) -> PathBuf {
         self.root
+            .join(tree)
             .join(key.owner().as_str())
-            .join(format!("{}.attrs", key.session()))
+            .join(key.session())
     }
 
     fn version_of(body: &[u8]) -> Version {
@@ -77,6 +97,11 @@ impl Filesystem {
             let _ = fs::remove_file(path);
             return Ok(());
         }
+        // The attrs tree mirrors the objects tree, so it needs its own
+        // directories.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| StoreError::Backend(error.to_string()))?;
+        }
         // Tab-separated because attribute names are constrained and values
         // are single-line; a JSON dependency is not worth it here.
         let body = attrs.iter().fold(String::new(), |mut body, (name, value)| {
@@ -89,18 +114,25 @@ impl Filesystem {
         fs::write(path, body).map_err(|error| StoreError::Backend(error.to_string()))
     }
 
+    /// Metadata without reading the body: size from `stat`, version from the
+    /// attrs file where `put` recorded it. Every request does at least one
+    /// `head`, and a listing does one per entry, so reading whole objects
+    /// here would make both O(bytes) instead of O(entries).
     fn meta_at(&self, key: &Key) -> Result<Option<ObjectMeta>, StoreError> {
-        let path = self.path_of(key);
-        let body = match fs::read(&path) {
-            Ok(body) => body,
+        let size = match fs::metadata(self.path_of(key)) {
+            Ok(meta) => meta.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StoreError::Backend(error.to_string())),
         };
+        let stored = Self::read_attrs(&self.attrs_path_of(key));
+        let version = stored
+            .get(VERSION_ATTR)
+            .map_or_else(|| Version::new("\"unknown\""), Version::new);
         Ok(Some(ObjectMeta {
             key: key.clone(),
-            version: Self::version_of(&body),
-            size: body.len() as u64,
-            attrs: Self::read_attrs(&self.attrs_path_of(key)),
+            version,
+            size,
+            attrs: stored.without(VERSION_ATTR),
         }))
     }
 
@@ -149,29 +181,32 @@ impl ObjectStore for Filesystem {
             fs::create_dir_all(parent).map_err(|error| StoreError::Backend(error.to_string()))?;
         }
         // Write-then-rename so a reader never sees a half-written object.
-        let temp = path.with_extension("tmp");
+        let temp = self.tree(TMP, key);
+        if let Some(parent) = temp.parent() {
+            fs::create_dir_all(parent).map_err(|error| StoreError::Backend(error.to_string()))?;
+        }
         fs::write(&temp, body).map_err(|error| StoreError::Backend(error.to_string()))?;
         fs::rename(&temp, &path).map_err(|error| StoreError::Backend(error.to_string()))?;
-        Self::write_attrs(&self.attrs_path_of(key), attrs)?;
-        Ok(Self::version_of(body))
+        let version = Self::version_of(body);
+        // The version rides with the attributes so `head` and `list` never
+        // have to open the object.
+        Self::write_attrs(
+            &self.attrs_path_of(key),
+            &attrs.clone().set(VERSION_ATTR, version.as_str()),
+        )?;
+        Ok(version)
     }
 
     async fn get(&self, key: &Key) -> Result<Option<Object>, StoreError> {
-        let path = self.path_of(key);
-        let body = match fs::read(&path) {
+        let body = match fs::read(self.path_of(key)) {
             Ok(body) => body,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StoreError::Backend(error.to_string())),
         };
-        Ok(Some(Object {
-            meta: ObjectMeta {
-                key: key.clone(),
-                version: Self::version_of(&body),
-                size: body.len() as u64,
-                attrs: Self::read_attrs(&self.attrs_path_of(key)),
-            },
-            body,
-        }))
+        let Some(meta) = self.meta_at(key)? else {
+            return Ok(None);
+        };
+        Ok(Some(Object { meta, body }))
     }
 
     async fn head(&self, key: &Key) -> Result<Option<ObjectMeta>, StoreError> {
@@ -202,7 +237,7 @@ impl ObjectStore for Filesystem {
         limit: usize,
     ) -> Result<Page, StoreError> {
         let mut slugs: Vec<Key> = Vec::new();
-        let owners = match fs::read_dir(&self.root) {
+        let owners = match fs::read_dir(self.root.join(OBJECTS)) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Page {
@@ -222,15 +257,8 @@ impl ObjectStore for Filesystem {
             for session in sessions {
                 let session = session.map_err(|e| StoreError::Backend(e.to_string()))?;
                 let name = session.file_name().to_string_lossy().into_owned();
-                // Sidecars and in-flight temporaries are not objects.
-                // Compared case-insensitively: the store may sit on a
-                // case-folding filesystem, where `.ATTRS` is the same file.
-                let reserved = Path::new(&name).extension().is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("attrs") || ext.eq_ignore_ascii_case("tmp")
-                });
-                if reserved {
-                    continue;
-                }
+                // No name filtering: attributes and temporaries live in
+                // their own trees, so everything here is an object.
                 let slug = format!("{}/{name}", owner.file_name().to_string_lossy());
                 if let Some(key) = Key::parse(&slug) {
                     slugs.push(key);
@@ -251,16 +279,19 @@ impl ObjectStore for Filesystem {
             if after.as_ref().is_some_and(|last| slug <= *last) {
                 continue;
             }
-            if objects.len() == limit {
+            if objects.len() > limit {
                 break;
             }
             if let Some(meta) = self.meta_at(&key)? {
                 objects.push(meta);
             }
         }
-        let next = (objects.len() == limit)
-            .then(|| objects.last().map(|meta| Cursor(meta.key.to_slug())))
-            .flatten();
+        let next = if objects.len() > limit {
+            objects.truncate(limit);
+            objects.last().map(|meta| Cursor(meta.key.to_slug()))
+        } else {
+            None
+        };
         Ok(Page { objects, next })
     }
 }

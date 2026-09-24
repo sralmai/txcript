@@ -185,6 +185,79 @@ pub async fn listing_paginates_in_order_with_attributes<S: ObjectStore>(store: &
     assert_eq!(paged, sorted, "paging must cover every object exactly once");
 }
 
+/// A session whose name looks like a backend's bookkeeping is still just a
+/// session.
+///
+/// A store that keeps metadata in a sibling file named `<session>.attrs`
+/// silently destroys the transcript stored at that name. Asserting it here
+/// means every backend has to keep its bookkeeping out of the key space.
+///
+/// # Panics
+/// When one object's write disturbs another.
+pub async fn bookkeeping_names_are_ordinary_sessions<S: ObjectStore>(store: &S) {
+    let plain = key("alice", "notes");
+    let lookalike = key("alice", "notes.attrs");
+    let temporary = key("alice", "notes.tmp");
+
+    for (k, body) in [
+        (&lookalike, &b"sidecar-lookalike"[..]),
+        (&temporary, &b"temp-lookalike"[..]),
+    ] {
+        store
+            .put(k, body, &Attrs::new(), &Precondition::None)
+            .await
+            .expect("put lookalike");
+    }
+    store
+        .put(
+            &plain,
+            b"real",
+            &Attrs::new().set("title", "notes"),
+            &Precondition::None,
+        )
+        .await
+        .expect("put plain");
+
+    for (k, expected) in [
+        (&lookalike, &b"sidecar-lookalike"[..]),
+        (&temporary, &b"temp-lookalike"[..]),
+        (&plain, &b"real"[..]),
+    ] {
+        let found = store.get(k).await.expect("get").expect("still present");
+        assert_eq!(found.body, expected, "{} was disturbed", k.to_slug());
+    }
+
+    let listed = store.list("alice/", None, 100).await.expect("list");
+    assert_eq!(listed.objects.len(), 3, "every session must be listed");
+}
+
+/// A page that exactly fills `limit` does not claim a next page.
+///
+/// Handing back a cursor for an empty page makes every caller pay a final
+/// pointless round trip, and hides real end-of-listing from them.
+///
+/// # Panics
+/// When a full final page reports more.
+pub async fn an_exactly_full_page_is_the_last_page<S: ObjectStore>(store: &S) {
+    for session in ["a", "b"] {
+        store
+            .put(
+                &key("alice", session),
+                b"{}",
+                &Attrs::new(),
+                &Precondition::None,
+            )
+            .await
+            .expect("seed");
+    }
+    let page = store.list("", None, 2).await.expect("list");
+    assert_eq!(page.objects.len(), 2);
+    assert_eq!(page.next, None, "an exactly-full page must not claim more");
+
+    let partial = store.list("", None, 5).await.expect("list");
+    assert_eq!(partial.next, None);
+}
+
 /// Run every case, each against a **fresh** store from `make`.
 ///
 /// Isolation is not a nicety here: the listing case asserts the exact
@@ -205,4 +278,6 @@ where
     if_version_rejects_stale_writes(&make()).await;
     delete_is_idempotent(&make()).await;
     listing_paginates_in_order_with_attributes(&make()).await;
+    bookkeeping_names_are_ordinary_sessions(&make()).await;
+    an_exactly_full_page_is_the_last_page(&make()).await;
 }

@@ -164,11 +164,18 @@ impl ObjectStore for InMemory {
             .filter(|(slug, _)| slug.starts_with(prefix))
             .filter(|(slug, _)| after.as_ref().is_none_or(|last| *slug > last))
             .map(|(_, stored)| Self::meta_of(stored))
+            .take(limit.saturating_add(1))
             .collect();
-        matching.truncate(limit);
-        let next = (matching.len() == limit)
-            .then(|| matching.last().map(|meta| Cursor(meta.key.to_slug())))
-            .flatten();
+        // Take one extra to learn whether anything follows. A page that
+        // merely fills to `limit` is not evidence of a next page, and
+        // handing back a cursor for an empty one makes every caller do a
+        // pointless final round trip.
+        let next = if matching.len() > limit {
+            matching.truncate(limit);
+            matching.last().map(|meta| Cursor(meta.key.to_slug()))
+        } else {
+            None
+        };
         Ok(Page {
             objects: matching,
             next,

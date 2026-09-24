@@ -6,8 +6,8 @@
 //! what keeps the Worker and a native binary from drifting apart, and it is
 //! why the access matrix can be tested without either of them.
 
-use crate::policy::{Action, Decision, ListScope, Policy, Target};
-use crate::{Key, KeyPrefix, Principal};
+use crate::policy::{Action, Decision, ListPlan, ListScope, Policy, Target};
+use crate::{Key, Principal};
 
 /// What the caller asked for, already parsed and validated by the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +73,7 @@ pub enum Plan {
         precondition: Precondition,
     },
     DeleteObject(Key),
-    ListPrefix(KeyPrefix),
+    List(ListPlan),
 }
 
 /// Decide one request.
@@ -137,7 +137,7 @@ pub fn decide(
             }
         }
 
-        Request::List { scope } => Plan::ListPrefix(policy.list_scope(who, *scope)),
+        Request::List { scope } => Plan::List(policy.list_scope(who, *scope)),
     }
 }
 
@@ -154,12 +154,20 @@ fn target_for(key: &Key, facts: Option<&ObjectFacts>) -> Target {
 /// `*` requires existence; a tag list requires a match. An absent object
 /// fails either way — a conditional update must never silently become an
 /// unconditional create.
+///
+/// With no `If-Match`, a write onto nothing becomes [`Precondition::IfAbsent`]
+/// rather than unconditional: the policy authorized a *create*, and between
+/// the HEAD and the write another caller may have created it. An
+/// unconditional write would silently destroy that one.
 fn precondition(
     if_match: Option<&str>,
     facts: Option<&ObjectFacts>,
 ) -> Result<Precondition, &'static str> {
     let Some(raw) = if_match.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(Precondition::None);
+        return Ok(match facts {
+            Some(_) => Precondition::None,
+            None => Precondition::IfAbsent,
+        });
     };
     let Some(facts) = facts else {
         return Err("conditional update on a transcript that does not exist");

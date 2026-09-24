@@ -101,11 +101,16 @@ impl Identity for StaticTokens {
         let Some(presented) = headers.get(&self.header) else {
             return Ok(None);
         };
-        Ok(self
-            .entries
-            .iter()
-            .find(|(token, _)| token == presented)
-            .map(|(_, principal)| principal.clone()))
+        // Constant-time comparison, and every entry is examined: a
+        // short-circuit here leaks the token a byte at a time to anyone who
+        // can time the endpoint.
+        let mut found = None;
+        for (token, principal) in &self.entries {
+            if constant_time_eq(token.as_bytes(), presented.as_bytes()) {
+                found = Some(principal.clone());
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -137,13 +142,23 @@ impl Identity for ForwardedClientCert {
         let Some(subject) = headers.get(&self.header).filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
-        let id = PrincipalId::new(stable_id(subject))
-            .ok_or_else(|| IdentityError("derived principal id was unusable".to_string()))?;
+        let id = PrincipalId::new(hex(subject)).ok_or_else(|| {
+            // Fail closed. Truncating to fit would map every subject sharing
+            // a prefix onto one principal, and those principals can delete
+            // each other's transcripts.
+            IdentityError(format!(
+                "client certificate subject is too long to encode as a \
+                 principal id (limit {MAX_SUBJECT_BYTES} bytes)"
+            ))
+        })?;
         Ok(Some(
             Principal::new(id, PrincipalKind::Service).with_label(subject),
         ))
     }
 }
+
+/// The longest subject `hex` can encode within [`PrincipalId`]'s limit.
+pub const MAX_SUBJECT_BYTES: usize = 64;
 
 /// An identity backend that is always unavailable — for asserting that a
 /// failing check surfaces as 503 rather than 401.
@@ -156,23 +171,36 @@ impl Identity for AlwaysFailing {
     }
 }
 
-/// A deterministic, injective id for arbitrary identity text.
-///
-/// FNV-1a over the bytes, rendered hex, **prefixed with the input length and
-/// escaped**, so it is a true encoding rather than a digest: distinct inputs
-/// cannot collide, which is the property ownership depends on. A real host
-/// uses SHA-256 for the same purpose; this crate has no dependencies, and
-/// correctness here is injectivity, not preimage resistance.
-fn stable_id(subject: &str) -> String {
-    let mut out = String::with_capacity(subject.len() * 2);
-    for byte in subject.as_bytes() {
-        // Hex-encode everything: the result is reversible, therefore
-        // injective, and is always a safe single path segment.
-        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(byte & 0x0f), 16).unwrap_or('0'));
+/// Compare without an early exit, so neither the match position nor the
+/// length of the shared prefix is observable in the time taken.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    // Length is not secret — a differing length is already visible in the
+    // request — but the contents must not short-circuit.
+    if a.len() != b.len() {
+        return false;
     }
-    out.truncate(128);
-    out
+    a.iter()
+        .zip(b)
+        .fold(0u8, |differences, (x, y)| differences | (x ^ y))
+        == 0
+}
+
+/// Hex-encode, so the result is reversible and therefore injective, and is
+/// always a safe single path segment.
+///
+/// Deliberately not truncated: a truncated encoding is not injective, and
+/// ownership is a comparison of these values. A host with a dependency
+/// budget should use a collision-resistant digest instead, which is
+/// fixed-length and so has no limit to fail against.
+fn hex(subject: &str) -> String {
+    subject
+        .bytes()
+        .fold(String::with_capacity(subject.len() * 2), |mut out, byte| {
+            const DIGITS: &[u8; 16] = b"0123456789abcdef";
+            out.push(DIGITS[usize::from(byte >> 4)] as char);
+            out.push(DIGITS[usize::from(byte & 0x0f)] as char);
+            out
+        })
 }
 
 /// Cases every [`Identity`] implementation must satisfy, including the ones
@@ -202,16 +230,36 @@ pub mod conformance {
         }
     }
 
-    /// A malformed credential is `Ok(None)`, not `Err`: a bad token is a
-    /// user error, and must not page anyone.
+    /// Garbage is a user error, not an outage: it must not surface as
+    /// `Err`, which a host turns into 503.
+    ///
+    /// This says nothing about whether garbage authenticates — for a backend
+    /// whose credential is an opaque subject string, any non-empty value is
+    /// a legitimate identity. Use [`unknown_credential_is_none`] for backends
+    /// that have a notion of an unrecognised credential.
     ///
     /// # Panics
     /// When the implementation returns `Err`.
-    pub fn malformed_credential_is_none<I: Identity>(identity: &I, header: &str) {
+    pub fn malformed_credential_is_not_an_outage<I: Identity>(identity: &I, header: &str) {
         let headers = Headers::new().with(header, "!!! not a credential !!!");
+        if let Err(error) = identity.principal(&headers) {
+            panic!("malformed credential must not be Err, got {error:?}");
+        }
+    }
+
+    /// A credential the backend does not recognise yields no principal.
+    ///
+    /// The strong form, for token and JWT backends. Asserting `Ok(None)`
+    /// rather than merely "not an error" is what catches a backend that
+    /// mints a principal out of anything it is handed.
+    ///
+    /// # Panics
+    /// When the implementation returns a principal or an error.
+    pub fn unknown_credential_is_none<I: Identity>(identity: &I, header: &str, garbage: &str) {
+        let headers = Headers::new().with(header, garbage);
         match identity.principal(&headers) {
-            Ok(_) => {}
-            Err(error) => panic!("malformed credential must not be Err, got {error:?}"),
+            Ok(None) => {}
+            other => panic!("an unrecognised credential must be Ok(None), got {other:?}"),
         }
     }
 
@@ -279,7 +327,8 @@ mod tests {
     fn static_tokens_satisfy_the_conformance_suite() {
         let identity = tokens();
         conformance::absent_credential_is_none(&identity);
-        conformance::malformed_credential_is_none(&identity, "x-token");
+        conformance::malformed_credential_is_not_an_outage(&identity, "x-token");
+        conformance::unknown_credential_is_none(&identity, "x-token", "not-a-real-token");
         conformance::ids_are_injective(&identity, "x-token", &["alice-secret", "nope"]);
     }
 
@@ -287,7 +336,7 @@ mod tests {
     fn forwarded_client_cert_satisfies_the_conformance_suite() {
         let identity = ForwardedClientCert::new("x-client-subject");
         conformance::absent_credential_is_none(&identity);
-        conformance::malformed_credential_is_none(&identity, "x-client-subject");
+        conformance::malformed_credential_is_not_an_outage(&identity, "x-client-subject");
         // The exact inputs that collided under the old lowercase-and-replace
         // scheme in the Worker prototype.
         conformance::ids_are_injective(
@@ -301,6 +350,48 @@ mod tests {
                 "a.b@x.com",
             ],
         );
+    }
+
+    #[test]
+    fn a_subject_too_long_to_encode_fails_closed() {
+        // Truncating to fit would map every subject sharing a 64-byte prefix
+        // onto one principal, who could then delete the others' transcripts.
+        let identity = ForwardedClientCert::new("x-client-subject");
+        let long = "a".repeat(MAX_SUBJECT_BYTES + 1);
+        let headers = Headers::new().with("x-client-subject", &long);
+        assert!(
+            identity.principal(&headers).is_err(),
+            "an unencodable subject must be refused, never truncated"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_agrees_with_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    proptest::proptest! {
+        /// Distinct subjects never share a principal id. The fixed-input
+        /// version of this test passed while a 128-character truncation was
+        /// silently collapsing every subject with a common 64-byte prefix;
+        /// a property sweep is what finds that class of bug.
+        #[test]
+        fn client_cert_ids_are_injective(a in ".{0,80}", b in ".{0,80}") {
+            let identity = ForwardedClientCert::new("s");
+            let of = |value: &str| {
+                identity
+                    .principal(&Headers::new().with("s", value))
+                    .ok()
+                    .flatten()
+                    .map(|p| p.id.as_str().to_string())
+            };
+            if let (Some(x), Some(y)) = (of(&a), of(&b)) {
+                proptest::prop_assert_eq!(x == y, a == b);
+            }
+        }
     }
 
     #[test]
