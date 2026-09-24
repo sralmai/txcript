@@ -73,6 +73,17 @@ async fn request(
     token: Option<&str>,
     body: Option<&str>,
 ) -> (u16, String) {
+    request_with(base, method, path, token, body, &[]).await
+}
+
+async fn request_with(
+    base: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+    extra: &[(&str, &str)],
+) -> (u16, String) {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let address = base.trim_start_matches("http://");
@@ -82,6 +93,9 @@ async fn request(
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
     if let Some(token) = token {
         head.push_str(&format!("x-token: {token}\r\n"));
+    }
+    for (name, value) in extra {
+        head.push_str(&format!("{name}: {value}\r\n"));
     }
     match body {
         Some(body) => head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len())),
@@ -304,6 +318,44 @@ async fn a_team_policy_hides_other_teams_from_a_listing() {
     assert!(!body.contains("bob/b"), "another team's must not be listed");
 }
 
+/// Same-team reads must actually work.
+///
+/// `TeamScoped` decides reads by the object's stored `team`, but nothing
+/// wrote it, so the attribute was always absent and the policy fell through
+/// to owner-only. It therefore behaved exactly like owner-private, and the
+/// test above passed for the wrong reason — it asserted another team was
+/// hidden, which was true of *every* other principal.
+#[tokio::test]
+async fn a_team_mate_can_read_what_a_prefix_policy_would_have_hidden() {
+    let policy = TeamScoped::new()
+        .with(PrincipalId::new("alice").expect("id"), "red")
+        .with(PrincipalId::new("bob").expect("id"), "red");
+    let server = serve(Box::new(policy)).await;
+    request(
+        &server.base,
+        "PUT",
+        "/s/sess-1",
+        Some("bob-secret"),
+        Some(DOC),
+    )
+    .await;
+
+    let (status, body) = request(
+        &server.base,
+        "GET",
+        "/s/bob/sess-1",
+        Some("alice-secret"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "a team mate's transcript must be readable");
+    assert!(body.contains("Fix the parser"));
+
+    // And it appears in a listing, which is the filtered path.
+    let (_, listed) = request(&server.base, "GET", "/s", Some("alice-secret"), None).await;
+    assert!(listed.contains("bob/sess-1"), "and must be listed");
+}
+
 #[tokio::test]
 async fn a_traversal_slug_is_refused() {
     let server = serve(Box::new(OwnerPrefix)).await;
@@ -327,6 +379,7 @@ async fn an_oversized_document_is_refused_before_it_is_stored() {
         limits: txcript_share_server::config::Limits {
             max_document_bytes: 64,
             page_size: 1000,
+            max_list_entries: 10_000,
         },
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -340,6 +393,87 @@ async fn an_oversized_document_is_refused_before_it_is_stored() {
     let big = format!(r#"{{"messages":[],"title":"{}"}}"#, "x".repeat(200));
     let (status, _) = request(&base, "PUT", "/s/sess-1", Some("alice-secret"), Some(&big)).await;
     assert_eq!(status, 413);
+}
+
+/// The configured document limit is the one that applies.
+///
+/// axum imposes a 2 MiB default body limit, so without raising it the
+/// `limits.max_document_bytes` check was dead above 2 MiB: a 3 MiB document
+/// was refused by the framework with a plain-text 413 the service never saw,
+/// whatever the operator configured.
+#[tokio::test]
+async fn a_document_under_the_configured_limit_is_accepted_above_axums_default() {
+    let server = serve(Box::new(OwnerPrefix)).await;
+    // Comfortably over axum's 2 MiB default, comfortably under the 10 MiB
+    // this server is configured for.
+    let big = format!(
+        r#"{{"id":"sess-1","messages":[],"title":"{}"}}"#,
+        "x".repeat(3 * 1024 * 1024)
+    );
+    let (status, _) = request(
+        &server.base,
+        "PUT",
+        "/s/sess-1",
+        Some("alice-secret"),
+        Some(&big),
+    )
+    .await;
+    assert_eq!(status, 201, "the configured limit must be the binding one");
+    assert!(stored(&server, "alice/sess-1").await.is_some());
+}
+
+/// `If-Match` on a DELETE has to reach the store.
+///
+/// `ObjectStore::delete` takes a precondition, but the handler passed
+/// `Precondition::None`, so a conditional delete was accepted and silently
+/// performed unconditionally — the caller believed it had guarded the
+/// removal against a concurrent update.
+#[tokio::test]
+async fn a_conditional_delete_is_refused_when_the_transcript_moved_on() {
+    let server = serve(Box::new(OwnerPrefix)).await;
+    request(
+        &server.base,
+        "PUT",
+        "/s/sess-1",
+        Some("alice-secret"),
+        Some(DOC),
+    )
+    .await;
+
+    let (status, _) = request_with(
+        &server.base,
+        "DELETE",
+        "/s/alice/sess-1",
+        Some("alice-secret"),
+        None,
+        &[("If-Match", "\"a-version-that-is-not-current\"")],
+    )
+    .await;
+    assert_eq!(status, 412, "a stale If-Match must refuse the delete");
+    assert!(
+        stored(&server, "alice/sess-1").await.is_some(),
+        "the refused delete must not have removed anything"
+    );
+
+    // The current version is accepted, so the guard is not simply broken.
+    let (_, listed) = request(&server.base, "GET", "/s", Some("alice-secret"), None).await;
+    let etag = listed
+        .split("\"etag\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\",").next())
+        .expect("etag in the listing")
+        .replace('\\', "");
+    let (status, _) = request_with(
+        &server.base,
+        "DELETE",
+        "/s/alice/sess-1",
+        Some("alice-secret"),
+        None,
+        &[("If-Match", &etag)],
+    )
+    .await;
+    assert_eq!(status, 204, "the current version must be accepted");
+    assert!(stored(&server, "alice/sess-1").await.is_none());
 }
 
 #[tokio::test]

@@ -258,6 +258,48 @@ pub async fn an_exactly_full_page_is_the_last_page<S: ObjectStore>(store: &S) {
     assert_eq!(partial.next, None);
 }
 
+/// A full attribute budget must not cost the object its version.
+///
+/// A backend that stores bookkeeping alongside caller attributes shares a
+/// budget with them, and a silently-dropped version is invisible until a
+/// conditional update fails forever: `head` reports something the caller
+/// cannot then match on. Found by review — `Filesystem` wrote its version
+/// through `Attrs::set`, which no-ops once the budget is full, so any
+/// transcript with a long title became permanently un-updatable.
+///
+/// # Panics
+/// When the version `put` returned is not what `head` reports, or a
+/// conditional update on it fails.
+pub async fn a_full_attribute_budget_does_not_lose_the_version<S: ObjectStore>(store: &S) {
+    let k = key("alice", "sess-fat-attrs");
+    // Comfortably past any reasonable metadata budget.
+    let attrs = Attrs::new()
+        .set("title", &"t".repeat(4000))
+        .set("cwd", &"/c".repeat(2000));
+
+    let written = store
+        .put(&k, b"first", &attrs, &Precondition::None)
+        .await
+        .expect("put with large attributes");
+
+    let head = store.head(&k).await.expect("head").expect("present");
+    assert_eq!(
+        head.version, written,
+        "head must report the version put returned, whatever the attributes cost"
+    );
+
+    // The version has to be usable, not merely present.
+    store
+        .put(
+            &k,
+            b"second",
+            &attrs,
+            &Precondition::IfVersion(written.as_str().to_string()),
+        )
+        .await
+        .expect("a conditional update on the reported version must succeed");
+}
+
 /// Run every case, each against a **fresh** store from `make`.
 ///
 /// Isolation is not a nicety here: the listing case asserts the exact
@@ -280,4 +322,5 @@ where
     listing_paginates_in_order_with_attributes(&make()).await;
     bookkeeping_names_are_ordinary_sessions(&make()).await;
     an_exactly_full_page_is_the_last_page(&make()).await;
+    a_full_attribute_budget_does_not_lose_the_version(&make()).await;
 }

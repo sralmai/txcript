@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State as AxumState};
+use axum::extract::{DefaultBodyLimit, Path, Query, State as AxumState};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -36,10 +36,16 @@ pub struct State {
 const TEAM_ATTR: &str = "team";
 
 pub fn router(state: Arc<State>) -> Router {
+    // axum defaults to a 2 MiB body limit, which silently overrides anything
+    // larger in the configuration: the framework refuses the request before
+    // a handler sees it, so the operator's limit never applies. Bind the two
+    // together so there is one number, and it is the configured one.
+    let limit = state.limits.max_document_bytes;
     Router::new()
         .route("/s", get(list))
         .route("/s/{session}", put(publish))
         .route("/s/{owner}/{session}", get(read).delete(remove))
+        .layer(DefaultBodyLimit::max(limit))
         .with_state(state)
 }
 
@@ -89,15 +95,23 @@ async fn publish(
         state.policy.as_ref(),
     );
 
-    let Plan::WriteObject { key, precondition } = &plan else {
+    let Plan::WriteObject {
+        key,
+        precondition,
+        attributes,
+    } = &plan
+    else {
         return execute(&state, &who, plan).await;
     };
+    // Policy attributes go on last: the policy reads these back to decide,
+    // so a document must not be able to spoof them.
+    let attrs = attributes
+        .iter()
+        .fold(summarize(&doc), |attrs, (name, value)| {
+            attrs.set(name, value)
+        });
     let created = matches!(precondition, Precondition::IfAbsent);
-    match state
-        .store
-        .put(key, &body, &summarize(&doc), precondition)
-        .await
-    {
+    match state.store.put(key, &body, &attrs, precondition).await {
         Ok(version) => (
             if created {
                 StatusCode::CREATED
@@ -156,13 +170,68 @@ async fn remove(
         Ok(facts) => facts,
         Err(rejection) => return rejection.into_response(),
     };
+    // A conditional delete has to reach the store, or `If-Match` on a DELETE
+    // is accepted and ignored — the caller believes it guarded the removal.
+    let guard = match conditional_delete(&headers, facts.as_ref()) {
+        Ok(guard) => guard,
+        Err(rejection) => return rejection.into_response(),
+    };
     let plan = decide(
         &Request::Delete { key },
         &who,
         facts.as_ref(),
         state.policy.as_ref(),
     );
+    if let Plan::DeleteObject(key) = &plan {
+        return match state.store.delete(key, &guard).await {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(StoreError::PreconditionFailed) => fail(
+                StatusCode::PRECONDITION_FAILED,
+                "transcript changed since it was read",
+            ),
+            Err(error) => backend(&error),
+        };
+    }
     execute(&state, &who, plan).await
+}
+
+/// Map a DELETE's `If-Match` onto a store precondition.
+///
+/// Absent means unconditional. `*` requires the object to exist. A tag list
+/// requires a match against what the HEAD found — and an absent object fails
+/// either way, so a conditional delete never silently becomes a no-op.
+fn conditional_delete(
+    headers: &HeaderMap,
+    facts: Option<&ObjectFacts>,
+) -> Result<Precondition, Rejection> {
+    let Some(raw) = header_value(headers, header::IF_MATCH.as_str()) else {
+        return Ok(Precondition::None);
+    };
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return Ok(Precondition::None);
+    }
+    let Some(facts) = facts else {
+        return Err(Rejection(
+            StatusCode::PRECONDITION_FAILED,
+            "conditional delete of a transcript that does not exist",
+        ));
+    };
+    if raw == "*" {
+        return Ok(Precondition::IfVersion(facts.version.clone()));
+    }
+    let matched = raw
+        .split(',')
+        .map(|tag| tag.trim().trim_start_matches("W/"))
+        .any(|tag| tag == facts.version);
+    if matched {
+        Ok(Precondition::IfVersion(facts.version.clone()))
+    } else {
+        Err(Rejection(
+            StatusCode::PRECONDITION_FAILED,
+            "transcript changed since it was read",
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,6 +332,13 @@ async fn execute(state: &State, who: &Principal, plan: Plan) -> Response {
                             .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
                             .collect(),
                     });
+                }
+                // `page_size` bounds one round trip; this bounds the
+                // response. Without it a listing walks the whole bucket into
+                // memory and the reply is as large as the store happens to be.
+                if entries.len() >= state.limits.max_list_entries {
+                    entries.truncate(state.limits.max_list_entries);
+                    break;
                 }
                 match page.next {
                     Some(next) => cursor = Some(next),

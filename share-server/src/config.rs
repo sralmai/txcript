@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use txcript_share_core::identity::{ForwardedClientCert, Identity, StaticTokens};
+use txcript_share_core::identity::{Identity, StaticTokens};
 use txcript_share_core::policy::{AllowAll, OwnerPrefix, Policy, ReadOnlyMirror, TeamScoped};
 use txcript_share_core::{Principal, PrincipalId, PrincipalKind};
 
@@ -48,7 +48,61 @@ pub enum IdentityConfig {
     /// **The proxy must be the only route to this service.** If the origin
     /// is reachable directly, anyone can set the header and become anyone.
     /// Bind to loopback and put the proxy in front, or use a network policy.
+    ///
+    /// The identity is hashed, so any length of address works and the raw
+    /// value never becomes a key or appears in a URL.
     ForwardedHeader { header: String },
+}
+
+/// A proxy-set identity header, hashed into a principal id.
+///
+/// `share-core`'s `ForwardedClientCert` hex-encodes instead, because that
+/// crate carries no cryptography — which caps it at 64 bytes and *fails* on
+/// anything longer. Under Cloudflare Access the header is an email address,
+/// so a 65-character address produced a permanent 503 that reads to an
+/// operator as a backend outage. A digest is fixed-width and has no such
+/// limit.
+#[derive(Debug, Clone)]
+pub struct HashedHeader {
+    header: String,
+}
+
+impl HashedHeader {
+    #[must_use]
+    pub fn new(header: &str) -> Self {
+        Self {
+            header: header.to_ascii_lowercase(),
+        }
+    }
+}
+
+impl Identity for HashedHeader {
+    fn principal(
+        &self,
+        headers: &txcript_share_core::identity::Headers,
+    ) -> Result<Option<Principal>, txcript_share_core::identity::IdentityError> {
+        use sha2::{Digest as _, Sha256};
+
+        let Some(subject) = headers.get(&self.header).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let digest = Sha256::digest(subject.as_bytes());
+        let id = digest
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{byte:02x}");
+                out
+            });
+        let principal = PrincipalId::new(id).ok_or_else(|| {
+            txcript_share_core::identity::IdentityError(
+                "derived principal id was unusable".to_string(),
+            )
+        })?;
+        Ok(Some(
+            Principal::new(principal, PrincipalKind::Human).with_label(subject),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +163,13 @@ pub struct Limits {
     pub max_document_bytes: usize,
     #[serde(default = "default_page_size")]
     pub page_size: usize,
+    /// Ceiling on how many entries one listing may accumulate.
+    ///
+    /// `page_size` bounds a single round trip; without this a listing walks
+    /// every page into memory, so the response size is set by how much the
+    /// bucket holds rather than by anything the operator chose.
+    #[serde(default = "default_max_list_entries")]
+    pub max_list_entries: usize,
 }
 
 const fn default_max_document_bytes() -> usize {
@@ -119,11 +180,16 @@ const fn default_page_size() -> usize {
     1000
 }
 
+const fn default_max_list_entries() -> usize {
+    10_000
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_document_bytes: default_max_document_bytes(),
             page_size: default_page_size(),
+            max_list_entries: default_max_list_entries(),
         }
     }
 }
@@ -166,9 +232,7 @@ impl IdentityConfig {
     /// When a token file cannot be read or contains an unusable principal id.
     pub fn build(&self) -> Result<Box<dyn Identity>, ConfigError> {
         match self {
-            IdentityConfig::ForwardedHeader { header } => {
-                Ok(Box::new(ForwardedClientCert::new(header)))
-            }
+            IdentityConfig::ForwardedHeader { header } => Ok(Box::new(HashedHeader::new(header))),
             IdentityConfig::StaticTokens {
                 header,
                 tokens_file,
@@ -254,6 +318,50 @@ mod tests {
         .expect("parses");
         assert_eq!(config.listen.to_string(), "127.0.0.1:8787");
         assert_eq!(config.limits.max_document_bytes, 10 * 1024 * 1024);
+    }
+
+    /// A long address is an ordinary user, not an outage.
+    ///
+    /// The hex-encoding identity in `share-core` caps at 64 bytes and errors
+    /// beyond it, which the server maps to 503. Under Cloudflare Access the
+    /// header is an email, so anyone with a long address got a permanent
+    /// "backend unavailable".
+    #[test]
+    fn a_long_identity_yields_a_principal_rather_than_an_outage() {
+        use txcript_share_core::identity::Headers;
+
+        let identity = HashedHeader::new("cf-access-authenticated-user-email");
+        let long = format!("{}@example.com", "a".repeat(200));
+        let headers = Headers::new().with("cf-access-authenticated-user-email", &long);
+
+        let found = identity
+            .principal(&headers)
+            .expect("a long address is not a backend failure")
+            .expect("it is still an identity");
+        assert_eq!(found.id.as_str().len(), 64, "a digest is fixed width");
+        assert_eq!(found.label.as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn hashed_identities_do_not_collide_where_naive_schemes_did() {
+        use txcript_share_core::identity::Headers;
+
+        let identity = HashedHeader::new("x-user");
+        let of = |value: &str| {
+            identity
+                .principal(&Headers::new().with("x-user", value))
+                .expect("no failure")
+                .expect("a principal")
+                .id
+                .as_str()
+                .to_string()
+        };
+        let ids: Vec<String> = ["a+b@x.com", "a_b@x.com", "a b@x.com", "A.B@x.com"]
+            .iter()
+            .map(|value| of(value))
+            .collect();
+        let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "principal ids must not collide");
     }
 
     #[test]

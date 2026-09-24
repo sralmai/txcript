@@ -141,7 +141,17 @@ export async function callerPrincipal(request, env) {
 
 let jwksCache = { at: 0, keys: null };
 
+// A forced refetch is throttled separately from the TTL. Without this, an
+// unauthenticated request naming an unknown `kid` drives an origin subrequest
+// every time, so forged headers with random `kid`s become an amplifier.
+const JWKS_FORCE_INTERVAL_MS = 60 * 1000;
+let lastForcedAt = 0;
+
 async function accessKeys(env, force = false) {
+  if (force) {
+    if (Date.now() - lastForcedAt < JWKS_FORCE_INTERVAL_MS) return jwksCache.keys ?? [];
+    lastForcedAt = Date.now();
+  }
   if (!force && jwksCache.keys && Date.now() - jwksCache.at < JWKS_TTL_MS) return jwksCache.keys;
   const url =
     env.ACCESS_CERTS_URL ?? `https://${env.ACCESS_TEAM}.cloudflareaccess.com/cdn-cgi/access/certs`;
@@ -154,6 +164,7 @@ async function accessKeys(env, force = false) {
 
 export function resetJwksCacheForTests() {
   jwksCache = { at: 0, keys: null };
+  lastForcedAt = 0;
 }
 
 export async function verifyAccessJwt(token, env) {

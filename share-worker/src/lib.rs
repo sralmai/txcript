@@ -102,6 +102,9 @@ pub enum Output {
     Write {
         key: String,
         precondition: PreconditionOut,
+        /// Attributes the policy requires on the stored object; the host
+        /// merges these over what it derives from the document.
+        attributes: Vec<(String, String)>,
     },
     Delete {
         key: String,
@@ -264,8 +267,16 @@ fn out(plan: Plan) -> Output {
             reason: reason.to_string(),
         },
         Plan::ReadObject(key) => Output::Read { key: key.to_slug() },
-        Plan::WriteObject { key, precondition } => Output::Write {
+        Plan::WriteObject {
+            key,
+            precondition,
+            attributes,
+        } => Output::Write {
             key: key.to_slug(),
+            attributes: attributes
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
             precondition: match precondition {
                 Precondition::None => PreconditionOut::None,
                 Precondition::IfAbsent => PreconditionOut::IfAbsent,

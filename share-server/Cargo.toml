@@ -16,6 +16,7 @@ axum = { version = "0.8.7", default-features = false, features = ["http1", "json
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+sha2 = "0.10"
 toml = "0.9.10"
 
 # Off by default so a filesystem deployment does not compile or ship the AWS
