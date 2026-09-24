@@ -80,6 +80,11 @@ store.save(&transcript)?;        // writes alice/<session-id>
 let found = store.discover()?;   // everyone's
 ```
 
+Or from the command line, by setting `TXCRIPT_SHARE_BUCKET` and
+`TXCRIPT_SHARE_OWNER` (plus `TXCRIPT_SHARE_ENDPOINT` for a non-AWS gateway).
+There is no service to derive a prefix from, so the owner is configuration —
+and the bucket policy is what makes it binding.
+
 Build with `--features share_s3`. Credentials come from the ambient AWS
 chain, so an instance role, a web identity, or `~/.aws/credentials` all work
 without configuration here.
@@ -167,6 +172,9 @@ export TXCRIPT_SHARE_URL=https://share.example.com
 export TXCRIPT_SHARE_HEADER_TOKEN="x-token: s3cr3t-alice"
 ```
 
+Build the CLI with `--features txcript/share` (or `txcript/share_s3` for the
+direct path).
+
 ```rust
 use txcript::harness::share::ShareStore;
 let store = ShareStore::from_env()?;
@@ -182,6 +190,34 @@ export TXCRIPT_SHARE_HEADER_SECRET="CF-Access-Client-Secret: ..."
 ```
 
 ---
+
+## From the command line
+
+With either path configured, `share` is a harness like any other:
+
+```sh
+txcript list --from share                       # everyone's published sessions
+txcript view <id> --from share                  # read one
+txcript continue <id> --from share --with codex # pull it into an agent
+txcript continue <session-id> --with share      # publish one of yours
+```
+
+Two things differ from a local harness, both deliberate:
+
+- **Publishing keeps the transcript's id and its recorded working
+  directory.** Continuing into an agent mints a fresh id and substitutes a
+  directory that exists locally, because the agent has to run somewhere.
+  Publishing is not continuing: the id is how someone finds the transcript,
+  and rewriting the cwd would rename someone else's history after this
+  machine's layout and tell every reader where you keep your code.
+- **There is nothing to resume into.** A share store is a place, not an
+  agent, so `continue --with share` publishes and stops.
+
+`share` joins aggregate discovery — `txcript list` with no `--from` includes
+it — because listing what others published is the point. Configuring an
+endpoint is the opt-in: with neither `TXCRIPT_SHARE_URL` nor
+`TXCRIPT_SHARE_BUCKET` set, nothing contacts anything and `list` is exactly
+as fast as before.
 
 ## Security, either way
 

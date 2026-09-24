@@ -69,7 +69,7 @@ mod pager;
 mod view;
 
 pub const HARNESSES: &str = "harnesses: claude_code, claude_chat, chatgpt, codex, opencode, pi, campfire, cursor, cursor_desktop, grok, grok_bot, fx, hermes, \
-     amp, antigravity, simple, cowork";
+     amp, antigravity, simple, cowork, share";
 
 /// The `txcript` binary's command line.
 #[derive(Parser)]
@@ -649,6 +649,44 @@ mod filter_tests {
         assert_eq!(listed, expected);
     }
 
+    /// Publishing must not rewrite a transcript's recorded directory to
+    /// this machine's. Doing so loses fidelity and tells every reader where
+    /// the publisher keeps their code.
+    #[test]
+    fn publishing_keeps_the_recorded_cwd_even_when_it_is_not_local() {
+        let mut copy = super::identity_tests::transcript();
+        copy.meta.cwd = Some("/somewhere/that/does/not/exist".into());
+        super::stamp_live_cwd(&mut copy, HarnessId::Share, None);
+        assert_eq!(
+            copy.meta.cwd.as_deref(),
+            Some("/somewhere/that/does/not/exist")
+        );
+
+        // A local agent still gets a directory it can actually run in.
+        let mut local = super::identity_tests::transcript();
+        local.meta.cwd = Some("/somewhere/that/does/not/exist".into());
+        super::stamp_live_cwd(&mut local, HarnessId::ClaudeCode, None);
+        assert_ne!(
+            local.meta.cwd.as_deref(),
+            Some("/somewhere/that/does/not/exist")
+        );
+    }
+
+    /// Publishing keeps the transcript's id: a share slug is how someone
+    /// finds it, not a collision to avoid.
+    #[test]
+    fn publishing_keeps_the_transcript_id() {
+        let mut copy = super::identity_tests::transcript();
+        copy.meta.id = "named-by-its-author".into();
+        super::fresh_identity(&mut copy, HarnessId::Share, None);
+        assert_eq!(copy.meta.id, "named-by-its-author");
+
+        let mut local = super::identity_tests::transcript();
+        local.meta.id = "named-by-its-author".into();
+        super::fresh_identity(&mut local, HarnessId::ClaudeCode, None);
+        assert_ne!(local.meta.id, "named-by-its-author");
+    }
+
     #[test]
     fn omitted_filters_include_every_harness_and_missing_cwd() {
         assert!(matches_filters(HarnessId::Codex, None, None, None));
@@ -773,7 +811,7 @@ mod stamp_tests {
         for cwd in [None, Some(String::new())] {
             let mut copy = super::identity_tests::transcript();
             copy.meta.cwd = cwd;
-            stamp_live_cwd(&mut copy, None);
+            stamp_live_cwd(&mut copy, HarnessId::ClaudeCode, None);
             assert_eq!(copy.meta.cwd.as_deref(), current.to_str());
 
             // Exercise the actual Claude Code writer: the session must be a
@@ -792,24 +830,32 @@ mod stamp_tests {
 
         let mut copy = super::identity_tests::transcript();
         copy.meta.cwd = Some("/no/such/dir/txcript-test".into());
-        stamp_live_cwd(&mut copy, None);
+        stamp_live_cwd(&mut copy, HarnessId::ClaudeCode, None);
         assert_eq!(copy.meta.cwd.as_deref(), current.to_str());
 
         // A cwd that still exists is kept.
         let mut copy = super::identity_tests::transcript();
         copy.meta.cwd = current.to_str().map(String::from);
-        stamp_live_cwd(&mut copy, None);
+        stamp_live_cwd(&mut copy, HarnessId::ClaudeCode, None);
         assert_eq!(copy.meta.cwd.as_deref(), current.to_str());
 
         // `--out` exports stay faithful to the source, dead cwd or not.
         let mut copy = super::identity_tests::transcript();
         copy.meta.cwd = Some("/no/such/dir/txcript-test".into());
-        stamp_live_cwd(&mut copy, Some(std::path::Path::new("/tmp/x")));
+        stamp_live_cwd(
+            &mut copy,
+            HarnessId::ClaudeCode,
+            Some(std::path::Path::new("/tmp/x")),
+        );
         assert_eq!(copy.meta.cwd.as_deref(), Some("/no/such/dir/txcript-test"));
 
         let mut copy = super::identity_tests::transcript();
         copy.meta.cwd = None;
-        stamp_live_cwd(&mut copy, Some(std::path::Path::new("/tmp/x")));
+        stamp_live_cwd(
+            &mut copy,
+            HarnessId::ClaudeCode,
+            Some(std::path::Path::new("/tmp/x")),
+        );
         assert_eq!(copy.meta.cwd, None);
     }
 }
@@ -1105,6 +1151,7 @@ mod style {
             HarnessId::Antigravity => "\x1b[94m",      // bright blue
             HarnessId::Simple => "\x1b[92m",           // bright green
             HarnessId::Cowork => "\x1b[38;5;208m",     // orange
+            HarnessId::Share => "\x1b[38;5;45m",       // cyan
         }
     }
 }
@@ -1192,7 +1239,7 @@ fn crop_loaded(
         .crop_to(&outcome.spans)
         .map_err(|error| error.to_string())?;
     fresh_identity(&mut cropped, target, None);
-    stamp_live_cwd(&mut cropped, None);
+    stamp_live_cwd(&mut cropped, target, None);
     let cropped_id = write_and_report(source, target, &cropped, None, None)?;
     let edited = match outcome.edited {
         0 => String::new(),
@@ -1463,7 +1510,7 @@ fn continue_document(
     // A document without a usable recorded cwd continues *here*: the target
     // stores shard by cwd, and "the directory the user ran txcript in" is the
     // only sensible home for a transcript that never had one.
-    stamp_live_cwd(&mut copy, out);
+    stamp_live_cwd(&mut copy, target, out);
     let resume_id = write_and_report(HarnessId::Simple, target, &copy, out, metadata)?;
     // Stdin was consumed by the document; hand the launched harness the
     // terminal instead, or an interactive resume would read EOF.
@@ -1613,7 +1660,7 @@ fn continue_amp_server_thread(
         (None, false) => {
             let mut copy = common.clone();
             fresh_identity(&mut copy, target, out);
-            stamp_live_cwd(&mut copy, out);
+            stamp_live_cwd(&mut copy, target, out);
             write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
         }
         // A sliced continue always rewrites — the server thread can't resume
@@ -1621,7 +1668,7 @@ fn continue_amp_server_thread(
         (Some(req), _) => {
             let mut copy = fragment::sliced(&common, req)?;
             fresh_identity(&mut copy, target, out);
-            stamp_live_cwd(&mut copy, out);
+            stamp_live_cwd(&mut copy, target, out);
             write_and_report(HarnessId::Amp, target, &copy, out, metadata)?
         }
     };
@@ -1650,14 +1697,14 @@ fn continue_session(
         (None, false) => {
             let mut common = found.read().map_err(|e| e.to_string())?;
             fresh_identity(&mut common, target, out);
-            stamp_live_cwd(&mut common, out);
+            stamp_live_cwd(&mut common, target, out);
             write_and_report(found.harness, target, &common, out, metadata)?
         }
         (Some(req), _) => {
             let common = found.read().map_err(|e| e.to_string())?;
             let mut copy = fragment::sliced(&common, req)?;
             fresh_identity(&mut copy, target, out);
-            stamp_live_cwd(&mut copy, out);
+            stamp_live_cwd(&mut copy, target, out);
             write_and_report(found.harness, target, &copy, out, metadata)?
         }
     };
@@ -1680,7 +1727,7 @@ fn continue_loaded_remote(
         None => common,
     };
     fresh_identity(&mut copy, target, out);
-    stamp_live_cwd(&mut copy, out);
+    stamp_live_cwd(&mut copy, target, out);
     let resume_id = write_and_report(source, target, &copy, out, metadata)?;
     launch(target, &resume_id, cwd.as_deref(), resume)
 }
@@ -1693,6 +1740,7 @@ fn ensure_crop_target(target: HarnessId) -> Result<(), String> {
             | HarnessId::Hermes
             | HarnessId::Amp
             | HarnessId::Simple
+            | HarnessId::Share
     ) {
         Err(format!(
             "{target} cannot store cropped sessions; pass --with <writable harness>"
@@ -1737,6 +1785,12 @@ fn fresh_identity(
     if out.is_some() {
         return;
     }
+    // Publishing is not continuing. A share slug is how someone finds the
+    // transcript, so the id is part of what is being published; minting a
+    // fresh UUID would name it something nobody asked for.
+    if target == HarnessId::Share {
+        return;
+    }
     // Codex stamps its rollouts with v7 UUIDs; matching the shape keeps the
     // copy out of any version-aware code path. v4 everywhere else. Harnesses
     // that need a different spelling (opencode's `ses_` prefix) re-shape this
@@ -1753,8 +1807,18 @@ fn fresh_identity(
 /// the store root or a dead directory would be invisible to a harness launched
 /// from the current project. `--out` exports keep the recorded cwd — they're
 /// faithful exports, and no harness reads them in place.
-fn stamp_live_cwd(common: &mut Transcript<Common>, out: Option<&std::path::Path>) {
+fn stamp_live_cwd(
+    common: &mut Transcript<Common>,
+    target: HarnessId,
+    out: Option<&std::path::Path>,
+) {
     if out.is_some() {
+        return;
+    }
+    // Publishing records the transcript as it is. Substituting the local
+    // directory would rewrite someone else's history to this machine's
+    // layout, and leak that layout to every reader.
+    if target == HarnessId::Share {
         return;
     }
     let unavailable = common
@@ -1872,6 +1936,11 @@ fn launch_via(
 // Result-shaped to slot into `launch_via`'s return paths.
 #[allow(clippy::unnecessary_wraps)]
 fn print_resume_command(bin: &str, args: &[String]) -> Result<ExitCode, String> {
+    // A target with nothing to launch — `share` is a place, not an agent —
+    // gets no hint rather than a truncated one.
+    if args.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
     println!(
         "  resume with: {}",
         style::scrub(&format!("{} {}", bin, args.join(" ")))
