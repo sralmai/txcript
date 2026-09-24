@@ -2,7 +2,7 @@
 
 Status: **design sketch**, for the *client* half. The service half is built:
 `share-core` decides, `share-store` defines the storage seams, and
-`worker/` is a thin shell over both. What remains unbuilt is the
+`deploy/cloudflare/` is a thin shell over both. What remains unbuilt is the
 `Store` implementation below, which lets `txcript list`/`view`/`continue`
 reach a share service.
 
@@ -34,7 +34,7 @@ never document bodies.
 Not implemented here, by design. The service sits behind Cloudflare Access;
 the client's entire auth surface is a header map. **Without that external
 gate the service is public even over HTTPS** — see the SECURITY note at the
-foot of `worker/src/index.js`.
+foot of `deploy/cloudflare/src/index.js`.
 
 ## `src/harness/share.rs`
 

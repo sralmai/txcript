@@ -10,7 +10,7 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { nixpkgs, rust-overlay, flake-utils, ... }:
+  outputs = { self, nixpkgs, rust-overlay, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -68,8 +68,38 @@
             echo "txcript dev shell — $(rustc --version)"
           '';
         };
+
+        # A *minimal* toolchain for building packages: rustc and cargo only.
+        #
+        # Not the dev-shell toolchain. That one carries rust-docs, clippy,
+        # and rustfmt, and building with it drags all three into the
+        # binary's runtime closure — 1.9 GiB of it, for a 2 MB executable,
+        # which then lands in the container image.
+        buildToolchain = pkgs.rust-bin.stable.latest.minimal;
+
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = buildToolchain;
+          rustc = buildToolchain;
+        };
+
+        share-server = pkgs.callPackage ./nix/package.nix { inherit rustPlatform; };
       in
       {
+        packages = {
+          default = share-server;
+          inherit share-server;
+
+          # The same host with the S3 backend compiled in. Separate because a
+          # filesystem deployment should not ship or audit the AWS client.
+          share-server-s3 = pkgs.callPackage ./nix/package.nix {
+            inherit rustPlatform;
+            features = [ "s3" ];
+          };
+
+          # An OCI image: the binary's closure, no base image, no distro.
+          container = pkgs.callPackage ./nix/container.nix { inherit share-server; };
+        };
+
         devShells = {
           # `nix develop` — everything CI needs except the npm packaging step.
           default = shellFor rust [ ];
@@ -82,5 +112,15 @@
         };
 
         formatter = pkgs.nixpkgs-fmt;
-      });
+      })
+    // {
+      # System-independent outputs. The service module and the authentication
+      # module are deliberately separate: swapping how callers are identified
+      # must not rebuild or reconfigure the service itself.
+      nixosModules = {
+        default = import ./nix/module.nix { inherit self; };
+        txcript-share = import ./nix/module.nix { inherit self; };
+        cloudflare-access = import ./nix/cloudflare-access.nix;
+      };
+    };
 }
