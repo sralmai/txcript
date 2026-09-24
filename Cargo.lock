@@ -4010,6 +4010,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "txcript-share-worker"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "txcript-share-core",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "typed-builder"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
