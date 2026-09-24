@@ -24,10 +24,14 @@
 pub mod catalog;
 pub mod filesystem;
 pub mod memory;
+#[cfg(feature = "s3")]
+pub mod s3;
 
 pub use catalog::{Catalog, CatalogError, Entry, Query, StoreDerived};
 pub use filesystem::Filesystem;
 pub use memory::InMemory;
+#[cfg(feature = "s3")]
+pub use s3::S3;
 
 use std::collections::BTreeMap;
 use std::fmt;
