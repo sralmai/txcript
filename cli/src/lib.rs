@@ -235,6 +235,57 @@ pub enum SessionCommand {
     /// model (docs/formats/simple.md), detached from any harness's store.
     /// Move it to another machine and `continue <file> --with <harness>`
     /// picks the session up there; a `#range` exports just those messages.
+    /// Publish a session into a harness's store, without launching anything
+    ///
+    /// The honest name for "write a copy and stop": `continue` launches the
+    /// harness afterwards, `push` never does. `--to share` is the default,
+    /// because publishing is what a share store is for, but any writable
+    /// harness works — `push <id> --to codex` writes a resumable Codex
+    /// session and prints the id to resume it with.
+    ///
+    /// The argument may be a local session id, an exact title, or a Simple
+    /// interchange document (a file path, or `-` for stdin).
+    Push {
+        /// Session id (any unambiguous prefix), its exact title, or a Simple
+        /// document path
+        #[arg(value_hint = clap::ValueHint::Other)]
+        id: String,
+        /// Where to publish it
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser, default_value = "share")]
+        to: HarnessId,
+        /// Only look for the source session in this harness
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        from: Option<HarnessId>,
+        /// Harness-specific options, as `key=value`
+        #[arg(long, value_name = "KEY=VALUE")]
+        metadata: Vec<String>,
+    },
+
+    /// Fetch a published session and write it here
+    ///
+    /// With no other flag it writes a Simple interchange document
+    /// (docs/formats/simple.md) to `./<id>.json`, which nothing else on this
+    /// machine can be surprised by. `--with <harness>` materializes a
+    /// resumable native session instead; `--out` picks the document's path.
+    ///
+    /// `--from share` is the default, but any harness works: `pull <id>
+    /// --from claude_code` writes a local session out as a document.
+    Pull {
+        /// Session id (any unambiguous prefix) or its exact title, with an
+        /// optional `#range` of 1-based inclusive message numbers
+        #[arg(value_hint = clap::ValueHint::Other)]
+        id: String,
+        /// Where to fetch it from
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser, default_value = "share")]
+        from: HarnessId,
+        /// Write a resumable session in this harness instead of a document
+        #[arg(long, value_name = "HARNESS", value_parser = HarnessParser)]
+        with: Option<HarnessId>,
+        /// Write the document here instead of `./<id>.json`
+        #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+        out: Option<PathBuf>,
+    },
+
     Export {
         /// Session id (any unambiguous prefix) or its exact title, with an
         /// optional `#range` of 1-based inclusive message numbers
@@ -387,13 +438,37 @@ pub fn run_session(command: SessionCommand, options: &Options) -> Result<ExitCod
             out,
             no_resume,
             metadata,
-        } => cmd_continue(&id, with, from, out.as_ref(), no_resume, &metadata),
+        } => {
+            // `continue` means "carry this on in an agent", and a share
+            // store is a place rather than an agent. Naming the right verb
+            // is more use than silently publishing. Checked here rather than
+            // inside `cmd_continue`, which `push` reaches through.
+            if with == Some(HarnessId::Share) {
+                return Err(
+                    "share is a place to publish, not an agent to continue in: use `txcript push <id>`"
+                        .to_string(),
+                );
+            }
+            cmd_continue(&id, with, from, out.as_ref(), no_resume, &metadata)
+        }
         SessionCommand::Crop { source, with, from } => cmd_crop(&source, with, from),
         SessionCommand::View {
             source,
             from,
             no_pager,
         } => view::cmd_view(&source, from, no_pager),
+        SessionCommand::Push {
+            id,
+            to,
+            from,
+            metadata,
+        } => cmd_push(&id, to, from, &metadata),
+        SessionCommand::Pull {
+            id,
+            from,
+            with,
+            out,
+        } => cmd_pull(&id, from, with, out.as_deref()),
         SessionCommand::Export { source, from, out } => {
             export::cmd_export(&source, from, out.as_deref())
         }
@@ -670,6 +745,48 @@ mod filter_tests {
             local.meta.cwd.as_deref(),
             Some("/somewhere/that/does/not/exist")
         );
+    }
+
+    /// `push` and `continue` must not drift about what writing a session
+    /// means, so `push` routes through the same path — which means the
+    /// refusal of `continue --with share` has to sit where only `continue`
+    /// passes, or it would break the verb it recommends.
+    #[test]
+    fn push_reaches_share_through_the_path_continue_refuses() {
+        use clap::Parser as _;
+        // `continue --with share` is refused, by name.
+        let parsed =
+            crate::Cli::try_parse_from(["txcript", "continue", "sess-1", "--with", "share"]);
+        assert!(parsed.is_ok(), "it parses; the refusal is a runtime one");
+
+        // `push` defaults to share and does not name a target at all.
+        let pushed =
+            crate::Cli::try_parse_from(["txcript", "push", "sess-1"]).expect("push parses");
+        assert!(matches!(
+            pushed.command,
+            crate::Command::Session(crate::SessionCommand::Push {
+                to: HarnessId::Share,
+                ..
+            })
+        ));
+    }
+
+    /// `pull` with no destination writes a document, never into a harness's
+    /// store: nothing on this machine should be surprised by a fetch.
+    #[test]
+    fn pull_defaults_to_a_document_from_share() {
+        use clap::Parser as _;
+        let parsed =
+            crate::Cli::try_parse_from(["txcript", "pull", "alice/sess-1"]).expect("pull parses");
+        assert!(matches!(
+            parsed.command,
+            crate::Command::Session(crate::SessionCommand::Pull {
+                from: HarnessId::Share,
+                with: None,
+                out: None,
+                ..
+            })
+        ));
     }
 
     /// Publishing keeps the transcript's id: a share slug is how someone
@@ -1250,6 +1367,74 @@ fn crop_loaded(
         "  cropped {}{edited} as {}",
         fragment::format_spans(&outcome.spans),
         style::scrub(&cropped_id)
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `push` — write a copy into a harness's store and stop.
+///
+/// Deliberately a thin wrapper over the same path `continue` uses, so the
+/// two cannot disagree about what writing a session means. The difference is
+/// the name and the absence of a launch.
+fn cmd_push(
+    id: &str,
+    to: HarnessId,
+    from: Option<HarnessId>,
+    metadata_specs: &[String],
+) -> Result<ExitCode, String> {
+    cmd_continue(id, Some(to), from, None, true, metadata_specs)
+}
+
+/// `pull` — fetch a session and write it here.
+///
+/// With no destination it writes a Simple document, which nothing on this
+/// machine resumes and no harness's store is surprised by. `--with` opts
+/// into materializing a native, resumable session instead.
+fn cmd_pull(
+    id: &str,
+    from: HarnessId,
+    with: Option<HarnessId>,
+    out: Option<&std::path::Path>,
+) -> Result<ExitCode, String> {
+    if let Some(target) = with {
+        // A native session, not launched: that is `push` with the source and
+        // destination the other way round.
+        return cmd_continue(id, Some(target), Some(from), None, true, &[]);
+    }
+
+    let (common, request) = view::load_source(id, Some(from))?;
+    let common = match &request {
+        Some(req) => fragment::sliced(&common, req)?,
+        None => common,
+    };
+    let document = export::render(&common)?;
+
+    // `./<id>.json` by default: a predictable name derived from the session
+    // rather than a path the caller has to think about.
+    let path = out.map_or_else(
+        || {
+            // The session segment of a slug, so `alice/sess-1` lands at
+            // `sess-1.json` rather than needing a directory.
+            let stem = common
+                .meta
+                .id
+                .rsplit('/')
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .unwrap_or("session");
+            std::path::PathBuf::from(format!("{stem}.json"))
+        },
+        std::path::Path::to_path_buf,
+    );
+    std::fs::write(&path, document).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    println!(
+        "{} → {}",
+        style::harness(
+            from,
+            0,
+            std::io::IsTerminal::is_terminal(&std::io::stdout())
+        ),
+        style::scrub(&path.display().to_string())
     );
     Ok(ExitCode::SUCCESS)
 }

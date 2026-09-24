@@ -193,14 +193,27 @@ export TXCRIPT_SHARE_HEADER_SECRET="CF-Access-Client-Secret: ..."
 
 ## From the command line
 
-With either path configured, `share` is a harness like any other:
-
 ```sh
-txcript list --from share                       # everyone's published sessions
-txcript view <id> --from share                  # read one
-txcript continue <id> --from share --with codex # pull it into an agent
-txcript continue <session-id> --with share      # publish one of yours
+txcript push <session-id>              # publish one of yours
+txcript list --from share              # everyone's published sessions
+txcript view <id> --from share         # read one
+txcript pull <id>                      # fetch it as ./<id>.json
+txcript pull <id> --with codex         # or as a resumable Codex session
+txcript continue <id> --with codex     # then carry it on
 ```
+
+`push` and `pull` are general verbs, not share-only ones: `--to` and
+`--from` default to `share` because that is what they are usually for, but
+`push <id> --to codex` writes a resumable Codex session without launching
+it, which is the honest name for what `continue --no-resume` did.
+
+`pull` with no destination writes a Simple interchange document, so a fetch
+never puts anything into a harness's store unasked. `--with <harness>` opts
+into a native, resumable session instead.
+
+`continue --with share` is refused, pointing at `push`. `continue` means
+"carry this on in an agent", and a share store is a place rather than an
+agent — naming the right verb is more use than quietly publishing.
 
 Two things differ from a local harness, both deliberate:
 
