@@ -69,6 +69,14 @@ sha1 = { version = "0.10.6", optional = true }
 sha2 = { version = "0.10.9", optional = true }
 
 [dev-dependencies]
+# The share round-trip test runs the real service in-process and drives it
+# with the real client, so the two halves are tested against each other
+# rather than against a mock of each other.
+txcript-share-server = { path = "share-server" }
+txcript-share-core = { path = "share-core" }
+txcript-share-store = { path = "share-store" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net"] }
+axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
 criterion = "0.8.2"
 proptest = "1.11.0"
 tempfile = "3.27.0"
@@ -124,6 +132,14 @@ claude_chat = [
 # featureless; the feature adds read-only Codex login reuse and
 # browser-compatible HTTPS access to ChatGPT's private read endpoints.
 chatgpt = [
+    "dep:futures-util",
+    "dep:tokio",
+    "dep:wreq",
+    "dep:wreq-util",
+]
+# The share client: a `Store` over a txcript share service. Needs the same
+# HTTPS transport the live web stores use, and nothing else.
+share = [
     "dep:futures-util",
     "dep:tokio",
     "dep:wreq",

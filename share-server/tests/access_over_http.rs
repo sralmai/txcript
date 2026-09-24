@@ -9,6 +9,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use txcript_share_core::identity::{Identity, StaticTokens};
@@ -81,10 +82,12 @@ async fn request(
         .expect("connect");
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
     if let Some(token) = token {
-        head.push_str(&format!("x-token: {token}\r\n"));
+        let _ = write!(head, "x-token: {token}\r\n");
     }
     match body {
-        Some(body) => head.push_str(&format!("Content-Length: {}\r\n\r\n", body.len())),
+        Some(body) => {
+            let _ = write!(head, "Content-Length: {}\r\n\r\n", body.len());
+        }
         None => head.push_str("Content-Length: 0\r\n\r\n"),
     }
     socket.write_all(head.as_bytes()).await.expect("write head");

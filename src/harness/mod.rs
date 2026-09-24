@@ -21,6 +21,8 @@ pub mod grok_bot;
 pub mod hermes;
 pub mod opencode;
 pub mod pi;
+#[cfg(feature = "share")]
+pub mod share;
 pub mod simple;
 
 pub(crate) mod jsonl;
