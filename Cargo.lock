@@ -2878,6 +2878,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "txcript-share-core"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
+name = "txcript-share-store"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+ "txcript-share-core",
+]
+
+[[package]]
 name = "typed-builder"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
