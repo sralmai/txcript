@@ -22,7 +22,7 @@ header = "x-token"
 tokens_file = "/run/credentials/txcript-share/tokens"
 
 [store]
-kind = "filesystem"                # or "memory"
+kind = "filesystem"                # or "memory", or "s3" (feature `s3`)
 root = "/var/lib/txcript-share"
 
 [policy]
@@ -45,6 +45,24 @@ page_size = 1000
 A `PUT` carries only a bare session id. The owner segment comes from the
 authenticated principal, so writing outside your own namespace is not
 *expressible* rather than merely denied.
+
+### S3 and compatible backends
+
+Built with `--features s3`, off by default so a filesystem deployment does
+not compile, ship, or audit the AWS client tree.
+
+```toml
+[store]
+kind = "s3"
+bucket = "txcript-share"
+endpoint = "https://<account>.r2.cloudflarestorage.com"  # omit for AWS
+force_path_style = true                                   # MinIO, Ceph
+```
+
+Credentials are **not** configured here. They come from the ambient AWS
+chain — instance role, web identity, or a credentials file the deployment
+mounts — so the same binary works under an IAM role, a Kubernetes service
+account, and a static key file without knowing which it is.
 
 ## Configuration is the deployment seam
 

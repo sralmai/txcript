@@ -13,6 +13,29 @@ publish = false
 # crate defines the shape they must fit.
 txcript-share-core = { path = "../share-core" }
 
+# S3 is optional so a Filesystem-only deployment does not compile, ship, or
+# audit the AWS client tree. The codec-free core and the other backends stay
+# dependency-light either way.
+[features]
+default = []
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:aws-smithy-types"]
+
+[dependencies.aws-config]
+version = "1.8"
+optional = true
+default-features = false
+features = ["behavior-version-latest", "rt-tokio", "rustls"]
+
+[dependencies.aws-sdk-s3]
+version = "1.123"
+optional = true
+default-features = false
+features = ["behavior-version-latest", "rt-tokio", "rustls"]
+
+[dependencies.aws-smithy-types]
+version = "1.3"
+optional = true
+
 [dev-dependencies]
 # A runtime, only to drive the conformance suite. Current-thread is enough
 # and matches the Worker's execution model.

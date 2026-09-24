@@ -57,6 +57,27 @@ pub enum StoreConfig {
     Filesystem {
         root: PathBuf,
     },
+    /// Any S3-compatible endpoint: AWS, `R2`, `MinIO`, Ceph.
+    ///
+    /// Credentials are **not** configured here. They come from the ambient
+    /// AWS chain — instance role, web identity, or a credentials file the
+    /// deployment mounts — so the same binary works under an IAM role, a
+    /// Kubernetes service account, and a static key file without knowing
+    /// which it is.
+    #[cfg(feature = "s3")]
+    S3 {
+        bucket: String,
+        /// Omit for AWS; set for `R2`, `MinIO`, or another gateway.
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Prefix inside the bucket, so one bucket can host several
+        /// deployments.
+        #[serde(default)]
+        root: Option<String>,
+        /// Self-hosted gateways generally serve path-style only.
+        #[serde(default)]
+        force_path_style: bool,
+    },
     /// Nothing survives a restart. For tests and demos.
     Memory,
 }

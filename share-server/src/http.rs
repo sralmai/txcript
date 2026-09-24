@@ -344,9 +344,9 @@ fn backend(error: &StoreError) -> Response {
 }
 
 fn backend_rejection(error: &StoreError) -> Rejection {
-    // Never surface the backend's own message: it carries paths, bucket
-    // names, and upstream detail.
-    eprintln!("store backend failed: {error}");
+    // Never surface the backend's own message to the caller: it carries
+    // paths, bucket names, and upstream detail. It still belongs in the log.
+    eprintln!("{error}");
     Rejection(StatusCode::SERVICE_UNAVAILABLE, "storage unavailable")
 }
 

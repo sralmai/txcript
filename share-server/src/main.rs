@@ -25,7 +25,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(State {
         identity: config.identity.build()?,
         policy: config.policy.build()?,
-        store: Store::build(&config.store),
+        store: Store::build(&config.store).await,
         limits: config.limits,
     });
 

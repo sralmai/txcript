@@ -18,14 +18,39 @@ use crate::config::StoreConfig;
 pub enum Store {
     Filesystem(Filesystem),
     Memory(InMemory),
+    #[cfg(feature = "s3")]
+    S3(txcript_share_store::S3),
 }
 
 impl Store {
-    #[must_use]
-    pub fn build(config: &StoreConfig) -> Self {
+    /// Build the configured backend.
+    ///
+    /// Async because the S3 client resolves credentials from the ambient
+    /// chain at construction, which can reach the network.
+    pub async fn build(config: &StoreConfig) -> Self {
         match config {
             StoreConfig::Filesystem { root } => Store::Filesystem(Filesystem::new(root)),
             StoreConfig::Memory => Store::Memory(InMemory::new()),
+            #[cfg(feature = "s3")]
+            StoreConfig::S3 {
+                bucket,
+                endpoint,
+                root,
+                force_path_style,
+            } => {
+                let loaded = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let mut builder =
+                    aws_sdk_s3::config::Builder::from(&loaded).force_path_style(*force_path_style);
+                if let Some(endpoint) = endpoint {
+                    builder = builder.endpoint_url(endpoint);
+                }
+                let client = aws_sdk_s3::Client::from_conf(builder.build());
+                let store = txcript_share_store::S3::new(client, bucket.clone());
+                Store::S3(match root {
+                    Some(root) => store.with_root(root.clone()),
+                    None => store,
+                })
+            }
         }
     }
 }
@@ -41,6 +66,8 @@ impl ObjectStore for Store {
         match self {
             Store::Filesystem(store) => store.put(key, body, attrs, precondition).await,
             Store::Memory(store) => store.put(key, body, attrs, precondition).await,
+            #[cfg(feature = "s3")]
+            Store::S3(store) => store.put(key, body, attrs, precondition).await,
         }
     }
 
@@ -48,6 +75,8 @@ impl ObjectStore for Store {
         match self {
             Store::Filesystem(store) => store.get(key).await,
             Store::Memory(store) => store.get(key).await,
+            #[cfg(feature = "s3")]
+            Store::S3(store) => store.get(key).await,
         }
     }
 
@@ -55,6 +84,8 @@ impl ObjectStore for Store {
         match self {
             Store::Filesystem(store) => store.head(key).await,
             Store::Memory(store) => store.head(key).await,
+            #[cfg(feature = "s3")]
+            Store::S3(store) => store.head(key).await,
         }
     }
 
@@ -62,6 +93,8 @@ impl ObjectStore for Store {
         match self {
             Store::Filesystem(store) => store.delete(key, precondition).await,
             Store::Memory(store) => store.delete(key, precondition).await,
+            #[cfg(feature = "s3")]
+            Store::S3(store) => store.delete(key, precondition).await,
         }
     }
 
@@ -74,6 +107,8 @@ impl ObjectStore for Store {
         match self {
             Store::Filesystem(store) => store.list(prefix, cursor, limit).await,
             Store::Memory(store) => store.list(prefix, cursor, limit).await,
+            #[cfg(feature = "s3")]
+            Store::S3(store) => store.list(prefix, cursor, limit).await,
         }
     }
 }

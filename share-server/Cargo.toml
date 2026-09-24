@@ -10,11 +10,19 @@ publish = false
 [dependencies]
 txcript-share-core = { path = "../share-core" }
 txcript-share-store = { path = "../share-store" }
+aws-config = { version = "1.8", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
+aws-sdk-s3 = { version = "1.123", optional = true, default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls"] }
 axum = { version = "0.8.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "0.9.10"
+
+# Off by default so a filesystem deployment does not compile or ship the AWS
+# client tree.
+[features]
+default = []
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "txcript-share-store/s3"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
