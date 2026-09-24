@@ -31,9 +31,13 @@ const OBJECTS: &str = "objects";
 const ATTRS: &str = "attrs";
 /// In-flight writes, renamed into place on completion.
 const TMP: &str = "tmp";
-/// The attribute name under which the version is persisted, so `head` and
-/// `list` never have to read a body to learn it.
-const VERSION_ATTR: &str = "\u{1}version";
+// Sidecar format: the first line is the object's version; caller attributes
+// follow, one `name<TAB>value` pair per line.
+//
+// The version is a *header*, not an attribute, because attributes share a
+// byte budget. Storing it among them meant a transcript with a long title
+// silently dropped its version, and every later conditional update failed
+// forever against a `head` that reported `"unknown"`.
 
 /// Objects as files under a root, one directory per owner.
 #[derive(Debug, Clone)]
@@ -79,24 +83,30 @@ impl Filesystem {
         Version::new(format!("\"{hash:016x}\""))
     }
 
-    fn read_attrs(path: &Path) -> Attrs {
-        // A missing or corrupt sidecar degrades to no attributes rather than
-        // failing the listing: metadata is a cache of what is in the body.
+    /// The sidecar's version header and its attributes.
+    ///
+    /// A missing or corrupt sidecar degrades to no version and no
+    /// attributes rather than failing the listing: it is a cache of what is
+    /// in the body, not the body.
+    fn read_sidecar(path: &Path) -> (Option<Version>, Attrs) {
         let Ok(raw) = fs::read_to_string(path) else {
-            return Attrs::new();
+            return (None, Attrs::new());
         };
-        raw.lines()
-            .fold(Attrs::new(), |attrs, line| match line.split_once('\t') {
-                Some((name, value)) => attrs.set(name, value),
-                None => attrs,
-            })
+        let mut lines = raw.lines();
+        let version = lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .map(Version::new);
+        let attrs = lines.fold(Attrs::new(), |attrs, line| match line.split_once('\t') {
+            Some((name, value)) => attrs.set(name, value),
+            None => attrs,
+        });
+        (version, attrs)
     }
 
-    fn write_attrs(path: &Path, attrs: &Attrs) -> Result<(), StoreError> {
-        if attrs.is_empty() {
-            let _ = fs::remove_file(path);
-            return Ok(());
-        }
+    /// Always written, even with no attributes: the version header has to
+    /// survive for a conditional update to be possible.
+    fn write_sidecar(path: &Path, version: &Version, attrs: &Attrs) -> Result<(), StoreError> {
         // The attrs tree mirrors the objects tree, so it needs its own
         // directories.
         if let Some(parent) = path.parent() {
@@ -104,13 +114,13 @@ impl Filesystem {
         }
         // Tab-separated because attribute names are constrained and values
         // are single-line; a JSON dependency is not worth it here.
-        let body = attrs.iter().fold(String::new(), |mut body, (name, value)| {
+        let mut body = format!("{version}\n");
+        for (name, value) in attrs.iter() {
             body.push_str(name);
             body.push('\t');
             body.push_str(&value.replace(['\n', '\t'], " "));
             body.push('\n');
-            body
-        });
+        }
         fs::write(path, body).map_err(|error| StoreError::Backend(error.to_string()))
     }
 
@@ -124,15 +134,15 @@ impl Filesystem {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StoreError::Backend(error.to_string())),
         };
-        let stored = Self::read_attrs(&self.attrs_path_of(key));
-        let version = stored
-            .get(VERSION_ATTR)
-            .map_or_else(|| Version::new("\"unknown\""), Version::new);
+        let (version, attrs) = Self::read_sidecar(&self.attrs_path_of(key));
         Ok(Some(ObjectMeta {
             key: key.clone(),
-            version,
+            // A sidecar lost or truncated out from under us leaves the object
+            // readable but not conditionally writable, which is the safe way
+            // round: a mismatched precondition refuses rather than clobbers.
+            version: version.unwrap_or_else(|| Version::new("\"unknown\"")),
             size,
-            attrs: stored.without(VERSION_ATTR),
+            attrs,
         }))
     }
 
@@ -188,12 +198,10 @@ impl ObjectStore for Filesystem {
         fs::write(&temp, body).map_err(|error| StoreError::Backend(error.to_string()))?;
         fs::rename(&temp, &path).map_err(|error| StoreError::Backend(error.to_string()))?;
         let version = Self::version_of(body);
-        // The version rides with the attributes so `head` and `list` never
-        // have to open the object.
-        Self::write_attrs(
-            &self.attrs_path_of(key),
-            &attrs.clone().set(VERSION_ATTR, version.as_str()),
-        )?;
+        // The version rides in the sidecar header so `head` and `list` never
+        // have to open the object, and so it cannot be crowded out by
+        // caller attributes.
+        Self::write_sidecar(&self.attrs_path_of(key), &version, attrs)?;
         Ok(version)
     }
 

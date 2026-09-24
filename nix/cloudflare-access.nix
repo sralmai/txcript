@@ -27,7 +27,8 @@ in
       type = lib.types.str;
       default = "cf-access-authenticated-user-email";
       description = ''
-        The header cloudflared presents to the origin.
+        The header cloudflared presents to the origin. It is hashed into a
+        principal id, so any length of address works.
 
         The service trusts it, so **the tunnel must be the only route in**.
         With the service on loopback that holds by construction; expose it on

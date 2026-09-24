@@ -114,6 +114,17 @@ pub trait Policy: Send + Sync {
     /// How a listing must be scoped and, where a prefix is insufficient,
     /// filtered.
     fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan;
+
+    /// Attributes to record on an object when this principal publishes it.
+    ///
+    /// A policy that decides by stored metadata has to be the thing that
+    /// writes it: nothing else knows what it will later want to read.
+    /// Without this, [`TeamScoped`] compared against a `team` no host ever
+    /// set, so its team-read branch was unreachable and it behaved exactly
+    /// like owner-private.
+    fn object_attributes(&self, _who: &Principal) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
 }
 
 /// Read anyone's, write only your own. The shipped policy.
@@ -229,6 +240,13 @@ impl Policy for TeamScoped {
                 }
             }
         }
+    }
+
+    fn object_attributes(&self, who: &Principal) -> Vec<(&'static str, String)> {
+        // Stamp the publisher's team, which is what `authorize` reads back.
+        self.team_of(&who.id)
+            .map(|team| vec![("team", team.to_string())])
+            .unwrap_or_default()
     }
 
     fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan {

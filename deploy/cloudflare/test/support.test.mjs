@@ -122,6 +122,27 @@ test("an unknown kid forces one JWKS refresh, so a key rotation recovers", async
   assert.ok(calls.count > primed, "an unknown kid must refresh the JWKS");
 });
 
+test("repeated unknown kids do not drive an origin subrequest each time", async () => {
+  // Otherwise an unauthenticated forged header is an amplifier: every
+  // request with a random `kid` costs a JWKS fetch.
+  resetJwksCacheForTests();
+  const { sign, jwks } = await issuer();
+  const calls = serveJwks(jwks);
+  await verifyAccessJwt(await sign({ email: "a@x.com", aud: [AUD], exp: future() }), env);
+
+  const before = calls.count;
+  for (let i = 0; i < 5; i += 1) {
+    await verifyAccessJwt(
+      await sign({ email: "a@x.com", aud: [AUD], exp: future() }, { kid: `forged-${i}` }),
+      env,
+    );
+  }
+  assert.ok(
+    calls.count - before <= 1,
+    `five unknown kids caused ${calls.count - before} fetches`,
+  );
+});
+
 // --- principal derivation ---------------------------------------------
 
 test("principal ids are injective where the old scheme collided", async () => {

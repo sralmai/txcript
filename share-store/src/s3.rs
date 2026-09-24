@@ -236,8 +236,13 @@ impl ObjectStore for S3 {
         let response = request.send().await.map_err(|error| classify(&error))?;
 
         let found: Vec<&S3Object> = response.contents().iter().collect();
+        // Whether more pages exist is a property of what S3 returned, not of
+        // how many entries survived parsing. Deriving it from the filtered
+        // count meant one stray key — a folder marker, a vanished object —
+        // made a truncated page look final and hid everything after it.
+        let more_remain = found.len() > limit;
         let mut objects = Vec::with_capacity(found.len().min(limit));
-        for entry in found {
+        for entry in &found {
             let Some(key) = entry
                 .key()
                 .and_then(|raw| Self::slug_of(&self.root, raw))
@@ -259,9 +264,15 @@ impl ObjectStore for S3 {
             ));
         }
 
-        let next = if objects.len() > limit {
-            objects.truncate(limit);
-            objects.last().map(|meta| Cursor(meta.key.to_slug()))
+        objects.truncate(limit);
+        let next = if more_remain {
+            // Resume from the last *raw* key, so a skipped entry does not
+            // become a gap the caller can never page past.
+            found
+                .get(limit.saturating_sub(1))
+                .and_then(|entry| entry.key())
+                .and_then(|raw| Self::slug_of(&self.root, raw))
+                .map(|slug| Cursor(slug.to_string()))
         } else {
             None
         };

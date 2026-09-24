@@ -71,6 +71,9 @@ pub enum Plan {
     WriteObject {
         key: Key,
         precondition: Precondition,
+        /// Attributes the policy requires on the stored object. The host
+        /// merges these over whatever it derives from the document.
+        attributes: Vec<(&'static str, String)>,
     },
     DeleteObject(Key),
     List(ListPlan),
@@ -120,7 +123,11 @@ pub fn decide(
             match policy.authorize(who, action, &target) {
                 Decision::Deny(reason) => Plan::Reject(Status::FORBIDDEN, reason),
                 Decision::Allow => match precondition(if_match.as_deref(), facts) {
-                    Ok(precondition) => Plan::WriteObject { key, precondition },
+                    Ok(precondition) => Plan::WriteObject {
+                        key,
+                        precondition,
+                        attributes: policy.object_attributes(who),
+                    },
                     Err(reason) => Plan::Reject(Status::PRECONDITION_FAILED, reason),
                 },
             }

@@ -121,9 +121,15 @@ async function writeObject(request, env, decision) {
   const doc = parseSimple(text);
   if (!doc) return json({ error: "body is not a Simple transcript document" }, 400);
 
+  // Policy attributes go on last: the policy reads these back to decide, so
+  // a document must not be able to spoof them.
+  const customMetadata = Object.assign(
+    summarize(doc),
+    Object.fromEntries(decision.attributes ?? []),
+  );
   const options = {
     httpMetadata: { contentType: "application/json" },
-    customMetadata: summarize(doc),
+    customMetadata,
   };
   // The core decided the concurrency rule; this only applies it.
   if (decision.precondition.kind === "if_absent") {
