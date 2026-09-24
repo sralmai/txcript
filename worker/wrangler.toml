@@ -1,0 +1,26 @@
+name = "txcript-share"
+main = "src/index.js"
+compatibility_date = "2026-09-24"
+
+# The decision core is wasm built from `share-worker`; `npm run build`
+# produces it before `wrangler deploy`.
+[build]
+command = "npm run build"
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["build/*.wasm"]
+
+[[r2_buckets]]
+binding = "SHARE"
+bucket_name = "txcript-share"
+
+[vars]
+# Your Zero Trust team name: <team>.cloudflareaccess.com
+ACCESS_TEAM = "example-team"
+# The Access application's AUD tag (Zero Trust -> Access -> Applications).
+ACCESS_AUD = "replace-with-your-application-audience-tag"
+# owner_prefix (default) | read_only_mirror | team_scoped
+POLICY = "owner_prefix"
+# Only for team_scoped: <principal-id>:<team> pairs, comma separated.
+# TEAMS = ""

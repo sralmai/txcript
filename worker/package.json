@@ -1,0 +1,11 @@
+{
+  "name": "txcript-share-worker",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker backing txcript's shared transcript store.",
+  "scripts": {
+    "build": "cargo build -p txcript-share-worker --release --target wasm32-unknown-unknown && wasm-bindgen --target bundler --out-dir build ../target/wasm32-unknown-unknown/release/txcript_share_worker.wasm",
+    "test": "node --test test/*.test.mjs",
+    "deploy": "npm run build && wrangler deploy"
+  }
+}

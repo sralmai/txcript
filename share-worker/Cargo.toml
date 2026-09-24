@@ -1,0 +1,22 @@
+[package]
+name = "txcript-share-worker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "wasm32 decision shim for txcript's shared transcript Worker."
+license = "Apache-2.0"
+publish = false
+
+[lib]
+# cdylib for the wasm artifact; rlib so the boundary can be tested natively,
+# without a browser or a Workers runtime.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+txcript-share-core = { path = "../share-core" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+wasm-bindgen = "0.2.126"
+
+[lints]
+workspace = true
