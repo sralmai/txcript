@@ -21,6 +21,13 @@
 //!   and *wrong* for the ordinary browser headers whose compression
 //!   behaviour is part of the profile being emulated.
 
+// This module's consumers are feature-gated and use different parts of it:
+// the harness stores need the browser profile and the Cloudflare-challenge
+// field, the share client needs the verbs. Any single feature combination
+// therefore leaves some of the surface unused, which is a property of the
+// gating rather than of the code.
+#![allow(dead_code)]
+
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -32,9 +39,34 @@ use crate::error::{Error, Result};
 /// How long a single request may take, start to finish.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One GET.
+/// Whether to imitate a browser.
+///
+/// The harness stores read private endpoints behind an edge that inspects
+/// TLS and HTTP/2 shape, so they must. A service we own inspects nothing,
+/// and imitating Chrome there buys nothing while making traffic harder to
+/// recognise in a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Profile {
+    /// Match Chromium's TLS, HTTP/2, and header profile.
+    Browser,
+    /// An ordinary HTTP client.
+    Plain,
+}
+
+/// What to do at the URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Method {
+    Get,
+    Put,
+    Delete,
+}
+
+/// One request.
 pub(crate) struct Request {
+    pub method: Method,
     pub url: String,
+    /// Body, for `PUT`. Empty otherwise.
+    pub body: Vec<u8>,
     /// Ordinary headers, compressed normally.
     pub headers: Vec<(&'static str, String)>,
     /// Credential-bearing headers, marked sensitive so they stay out of the
@@ -74,6 +106,13 @@ impl Agent {
     /// When the thread, the Tokio runtime, or the HTTP client cannot be
     /// built.
     pub(crate) fn start(harness: &'static str) -> Result<Self> {
+        Self::start_with(harness, Profile::Browser)
+    }
+
+    /// # Errors
+    /// When the thread, the Tokio runtime, or the HTTP client cannot be
+    /// built.
+    pub(crate) fn start_with(harness: &'static str, profile: Profile) -> Result<Self> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
@@ -84,18 +123,24 @@ impl Agent {
                     .build()
                     .map_err(|error| format!("could not start HTTP runtime: {error}"));
                 let client = runtime.as_ref().map_err(Clone::clone).and_then(|_| {
-                    wreq::Client::builder()
-                        // Both services' desktop clients currently embed
-                        // Chromium 148. Matching the browser's TLS, HTTP/2,
-                        // and header profile is required by the edge in
-                        // front of these private read APIs.
-                        .emulation(wreq_util::Profile::Chrome148)
+                    let builder = wreq::Client::builder()
                         // Never let a credential-bearing header follow a
-                        // response to another origin.
+                        // response to another origin. For a gateway-protected
+                        // endpoint a 302 to a login page is an
+                        // authentication failure, not content.
                         .redirect(wreq::redirect::Policy::none())
-                        .timeout(TIMEOUT)
+                        .timeout(TIMEOUT);
+                    let builder = match profile {
+                        // Both desktop clients currently embed Chromium 148.
+                        // Matching the browser's TLS, HTTP/2, and header
+                        // profile is required by the edge in front of these
+                        // private read APIs.
+                        Profile::Browser => builder.emulation(wreq_util::Profile::Chrome148),
+                        Profile::Plain => builder,
+                    };
+                    builder
                         .build()
-                        .map_err(|error| format!("could not build browser HTTP client: {error}"))
+                        .map_err(|error| format!("could not build HTTP client: {error}"))
                 });
                 let startup = match (&runtime, &client) {
                     (Ok(_), Ok(_)) => Ok(()),
@@ -131,6 +176,14 @@ impl Agent {
     /// # Errors
     /// When the worker has stopped, or the request fails or exceeds its cap.
     pub(crate) fn get(&self, request: Request) -> Result<Response> {
+        self.send(request)
+    }
+
+    /// Perform one request on the worker thread and wait for it.
+    ///
+    /// # Errors
+    /// When the worker has stopped, or the request fails or exceeds its cap.
+    pub(crate) fn send(&self, request: Request) -> Result<Response> {
         let harness = self.harness;
         let (reply, response) = mpsc::sync_channel(1);
         self.sender
@@ -153,7 +206,11 @@ async fn execute(
     client: &wreq::Client,
     request: &Request,
 ) -> std::result::Result<Response, String> {
-    let mut builder = client.get(&request.url);
+    let mut builder = match request.method {
+        Method::Get => client.get(&request.url),
+        Method::Put => client.put(&request.url).body(request.body.clone()),
+        Method::Delete => client.delete(&request.url),
+    };
     for (name, value) in &request.headers {
         builder = builder.header(*name, value.as_str());
     }

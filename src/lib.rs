@@ -23,7 +23,7 @@ pub mod error;
 pub mod harness;
 // Shared browser-profile HTTP transport for the live remote stores. Private:
 // the harness modules are its only callers.
-#[cfg(any(feature = "claude_chat", feature = "chatgpt"))]
+#[cfg(any(feature = "claude_chat", feature = "chatgpt", feature = "share"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod local;

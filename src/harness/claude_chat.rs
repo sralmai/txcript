@@ -933,6 +933,8 @@ mod remote {
         let mut sensitive = vec![("cookie", cookie)];
         sensitive.extend(headers);
         http::Request {
+            method: http::Method::Get,
+            body: Vec::new(),
             url,
             headers: vec![
                 ("accept", accept.to_string()),

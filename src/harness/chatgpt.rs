@@ -580,6 +580,8 @@ mod remote {
 
         fn get_json(&self, path: &str) -> Result<Value> {
             let response = self.agent.get(http::Request {
+                method: http::Method::Get,
+                body: Vec::new(),
                 url: format!("{}{path}", self.base_url),
                 headers: vec![
                     ("accept", "application/json".to_string()),

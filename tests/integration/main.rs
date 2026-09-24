@@ -29,3 +29,4 @@ mod store_delete;
 
 #[cfg(feature = "search")]
 mod search;
+mod share_round_trip;

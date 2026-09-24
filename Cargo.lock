@@ -3922,6 +3922,7 @@ name = "txcript"
 version = "0.14.4"
 dependencies = [
  "aes",
+ "axum",
  "base64",
  "cbc",
  "chrono",
@@ -3939,6 +3940,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "txcript-share-core",
+ "txcript-share-server",
+ "txcript-share-store",
  "uuid",
  "wasm-bindgen",
  "wreq",
