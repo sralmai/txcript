@@ -2,7 +2,7 @@
 # cli/. Bin-only dependencies (clap) live in the cli crate so lib consumers
 # never compile them.
 [workspace]
-members = ["cli", "share-core", "share-store"]
+members = ["cli", "share-core", "share-server", "share-store"]
 # `cargo run` / `cargo build` with no -p target the CLI; `--workspace` still
 # covers the lib.
 default-members = ["cli"]
