@@ -43,7 +43,7 @@
           clang
         ];
 
-        darwinDeps = pkgs.lib.optionals pkgs.stdenv.isDarwin
+        darwinDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
           (with pkgs; [ libiconv ]);
 
         # The npm package build: `wasm-bindgen-cli` MUST match the
