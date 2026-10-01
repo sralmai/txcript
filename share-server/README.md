@@ -17,9 +17,9 @@ txcript-share-server /etc/txcript-share/config.toml
 listen = "127.0.0.1:8787"          # loopback by default; put a proxy in front
 
 [identity]
-kind = "static_tokens"             # or "forwarded_header"
+kind = "static_tokens"             # or "forwarded_header", "cloudflare_access"
 header = "x-token"
-tokens_file = "/run/credentials/txcript-share/tokens"
+tokens_file = "/run/credentials/txcript-share.service/tokens"
 
 [store]
 kind = "filesystem"                # or "memory", or "s3" (feature `s3`)
@@ -84,16 +84,69 @@ security-relevant field must not read as "off".
   proxy. **The proxy must be the only route to this service.** If the origin
   is reachable directly, anyone can set the header and become anyone. Bind to
   loopback, or use a network policy.
+- `cloudflare_access` — verify `Cf-Access-Jwt-Assertion` here, against the
+  team's JWKS and the application's AUD tag. Access in front is the gate,
+  this is the lock behind it, so a direct route to the origin is no longer a
+  forgery hole.
 
-Cloudflare Access JWT verification is an `Identity` implementation and lands
-next; it needs JWKS fetching and RS256, which is why it is not in the
-dependency-free core. Nothing else changes when it arrives — that is what the
-seam is for.
+```toml
+[identity]
+kind = "cloudflare_access"
+team = "example"                   # the <team> of <team>.cloudflareaccess.com
+aud_file = "/run/credentials/txcript-share.service/access-aud"
+```
+
+Built with `--features cloudflare_access`, off by default for the same reason
+`s3` is: a deployment that authenticates some other way should not compile or
+ship a TLS client it never calls. Under NixOS,
+`nixosModules.cloudflare-access` selects both the identity and the matching
+build.
+
+An SSO login authenticates as its `email`, a service token as its
+`common_name`, and the principal id is the SHA-256 of that string — the same
+digest `deploy/cloudflare/src/support.js` computes, so the Worker and this
+host agree on who owns a transcript when both front one bucket.
+
+Fetching happens on a refresher thread, never on a request: `principal()`
+reads the key set that thread published and returns, so a certs endpoint that
+hangs costs a request nothing, and no volume of forged `kid`s can turn into
+outbound requests. The key set is fetched at startup, hourly after that, and
+every 5s while fetching is failing — a service that comes up before its
+network must recover on its own.
+
+A rotation is therefore picked up within the hour. Cloudflare publishes a new
+key before it retires the old one, so tokens keep verifying across the change.
+
+Which refusal a caller gets turns on whether the key set is **current**, not
+on whether the last refresh happened to fail:
+
+| key set | `kid` we hold | `kid` we do not |
+|---|---|---|
+| fetched within the hour | verify | 401 — we hold what the team publishes |
+| fetched longer ago | verify, for a day | 503 — we could not check |
+| never fetched | — | 503 |
+
+An outage must not read as a wall of user auth failures, and a forged flood
+during one must not read as an outage.
+
+**Switching an existing deployment from `forwarded_header` changes who owns
+what.** The principal id is derived from the Access identity rather than from
+the header value, so transcripts published under the old scheme keep their old
+owner prefix: still readable, no longer writable by the person who published
+them. Migrate the keys, or start on an empty prefix.
+
+### Setting it up
+
+[Cloudflare Access in front of the share service](../docs/cloudflare-access.md)
+is the end-to-end guide: the Zero Trust side (team, application, AUD tag,
+service tokens), the service and NixOS configuration, the checks to run once
+against a real tenant — no local test can cover those — and what each failure
+looks like in the log.
 
 ## Testing
 
 ```sh
-cargo test -p txcript-share-server
+cargo test -p txcript-share-server --all-features
 ```
 
 `tests/access_over_http.rs` runs the access matrix over real HTTP against a
@@ -102,3 +155,10 @@ they re-read the object afterwards and assert the bytes are unchanged, because
 a 403 that still mutates the store is the failure a status-only assertion
 misses — and that is exactly what a sabotaged handler produced when this was
 checked.
+
+`src/access.rs` mints real RS256 tokens from a throwaway key and runs the
+shared `identity::conformance` suite against the verifier, plus the cases a
+suite cannot state: a rotation picked up by the refresher, a flood of forged
+`kid`s that costs no fetch at all, a key set that keeps working when
+refreshing it starts failing, and a hung certs endpoint that costs the request
+path nothing.

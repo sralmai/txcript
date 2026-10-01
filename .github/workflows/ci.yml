@@ -60,6 +60,20 @@ jobs:
       - run: cargo check -p txcript --lib --target wasm32-unknown-unknown --no-default-features --features wasm
       - run: cargo check -p txcript --lib --target wasm32-unknown-unknown --no-default-features --features wasm,search
 
+  # The Worker's I/O half. Its decision half is Rust, covered by the test job
+  # above; this is the JWT verification, request parsing, and metadata budget
+  # that `node --test` can reach without a wasm module to load.
+  worker:
+    name: Cloudflare Worker (node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm test
+        working-directory: deploy/cloudflare
+
   msrv:
     name: MSRV (1.96)
     runs-on: ubuntu-latest
@@ -73,16 +87,11 @@ jobs:
 
   # Publish readiness. Every merged head must be releasable as-is, so the
   # packaging steps the release runs are proven here, on the PR.
-  crate-package:
-    name: crates.io package (dry-run)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - run: cargo publish --dry-run --locked -p txcript
+  # No crates.io dry-run job. `share_s3` depends on txcript-share-core and
+  # txcript-share-store, which are `publish = false`, so the manifest is not
+  # publishable — and this fork could not publish `txcript` anyway, as it does
+  # not own the name. Restore the job together with that capability if the
+  # feature is ever dropped or the support crates are published upstream.
 
   npm-package:
     name: npm package (dry-run)
