@@ -104,6 +104,9 @@ pub enum Output {
     Write {
         key: String,
         precondition: PreconditionOut,
+        /// Recorded on the object by the host. `null` for the policies that
+        /// decide from the key alone.
+        team: Option<String>,
     },
     Delete {
         key: String,
@@ -265,13 +268,18 @@ fn out(plan: Plan) -> Output {
             reason: reason.to_string(),
         },
         Plan::ReadObject(key) => Output::Read { key: key.to_slug() },
-        Plan::WriteObject { key, precondition } => Output::Write {
+        Plan::WriteObject {
+            key,
+            precondition,
+            team,
+        } => Output::Write {
             key: key.to_slug(),
             precondition: match precondition {
                 Precondition::None => PreconditionOut::None,
                 Precondition::IfAbsent => PreconditionOut::IfAbsent,
                 Precondition::IfVersion(version) => PreconditionOut::IfVersion { version },
             },
+            team,
         },
         Plan::DeleteObject(key) => Output::Delete { key: key.to_slug() },
         Plan::List(list) => Output::List {

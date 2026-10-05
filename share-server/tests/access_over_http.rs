@@ -308,6 +308,31 @@ async fn a_team_policy_hides_other_teams_from_a_listing() {
 }
 
 #[tokio::test]
+async fn a_teammate_can_read_what_a_teammate_published() {
+    // The case the policy exists for, and the one nothing covered: both
+    // principals in *one* team. It only works if the team was recorded at
+    // publish time, because the read decision reads it back off the object.
+    // With the two principals in different teams — as the listing test has
+    // them — a policy that recorded nothing is indistinguishable from one
+    // that works.
+    let policy = TeamScoped::new()
+        .with(PrincipalId::new("alice").expect("id"), "red")
+        .with(PrincipalId::new("bob").expect("id"), "red");
+    let server = serve(Box::new(policy)).await;
+
+    let (status, _) = request(&server.base, "PUT", "/s/a", Some("alice-secret"), Some(DOC)).await;
+    assert_eq!(status, 201);
+
+    let (status, body) = request(&server.base, "GET", "/s/alice/a", Some("bob-secret"), None).await;
+    assert_eq!(status, 200, "a teammate's transcript must be readable");
+    assert!(body.contains("Fix the parser"));
+
+    let (status, body) = request(&server.base, "GET", "/s", Some("bob-secret"), None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("alice/a"), "and must appear in the listing");
+}
+
+#[tokio::test]
 async fn a_traversal_slug_is_refused() {
     let server = serve(Box::new(OwnerPrefix)).await;
     for path in ["/s/..%2F..%2Fetc%2Fpasswd", "/s/alice/..", "/s/../bob/x"] {

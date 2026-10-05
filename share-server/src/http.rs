@@ -89,15 +89,22 @@ async fn publish(
         state.policy.as_ref(),
     );
 
-    let Plan::WriteObject { key, precondition } = &plan else {
+    let Plan::WriteObject {
+        key,
+        precondition,
+        team,
+    } = &plan
+    else {
         return execute(&state, &who, plan).await;
     };
     let created = matches!(precondition, Precondition::IfAbsent);
-    match state
-        .store
-        .put(key, &body, &attrs_for_document(&doc), precondition)
-        .await
-    {
+    // The team comes from the policy, not the document, so a publisher
+    // cannot choose which team its transcript counts as belonging to.
+    let mut attrs = attrs_for_document(&doc);
+    if let Some(team) = team {
+        attrs = attrs.set("team", team);
+    }
+    match state.store.put(key, &body, &attrs, precondition).await {
         Ok(version) => (
             if created {
                 StatusCode::CREATED
