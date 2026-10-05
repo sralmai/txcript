@@ -49,6 +49,75 @@ pub async fn round_trips_bodies_and_attributes<S: ObjectStore>(store: &S) {
     assert_eq!(head.version, found.meta.version, "head and get must agree");
 }
 
+/// The version `put` returns is the version the store then reports.
+///
+/// Asserting only that `head` and `get` agree let a backend report a version
+/// that was never the one it handed back — and a caller that echoes what it
+/// reads into `IfVersion` would then be matching on a value the store invented.
+///
+/// # Panics
+/// When the reported version is not the one `put` returned.
+pub async fn the_reported_version_is_the_one_put_returned<S: ObjectStore>(store: &S) {
+    let k = key("alice", "sess-1");
+    // Enough attributes to crowd a byte budget: a backend that stores the
+    // version alongside them must not let them displace it.
+    let attrs = Attrs::new()
+        .set("title", &"t".repeat(600))
+        .set("cwd", &"/very/long/path".repeat(60))
+        .set("git_branch", &"b".repeat(300));
+    let returned = store
+        .put(&k, b"body", &attrs, &Precondition::None)
+        .await
+        .expect("put");
+
+    let head = store.head(&k).await.expect("head").expect("meta present");
+    assert_eq!(
+        head.version, returned,
+        "the store reported a version it never returned from put"
+    );
+}
+
+/// The version follows the body, so an identical rewrite keeps it.
+///
+/// This is S3's semantics and the whole set has to match it: an `ETag` is the
+/// body's digest and cannot be made to say otherwise. A backend whose version
+/// moved on every write — the in-memory double's counter did — lets a caller
+/// build on a guarantee the backend the service ships on cannot honour.
+///
+/// # Panics
+/// When a rewrite of identical bytes reports a different version.
+pub async fn the_version_follows_the_body<S: ObjectStore>(store: &S) {
+    let k = key("alice", "sess-same");
+    let first = store
+        .put(
+            &k,
+            b"identical",
+            &Attrs::new().set("title", "one"),
+            &Precondition::None,
+        )
+        .await
+        .expect("put");
+    let again = store
+        .put(
+            &k,
+            b"identical",
+            &Attrs::new().set("title", "two"),
+            &Precondition::None,
+        )
+        .await
+        .expect("put");
+    assert_eq!(
+        first, again,
+        "the same bytes are the same version, whatever the metadata"
+    );
+
+    let changed = store
+        .put(&k, b"different", &Attrs::new(), &Precondition::None)
+        .await
+        .expect("put");
+    assert_ne!(first, changed, "different bytes are a different version");
+}
+
 /// A missing object is `Ok(None)`, never an error.
 ///
 /// # Panics
@@ -273,6 +342,8 @@ where
     F: Fn() -> S,
 {
     round_trips_bodies_and_attributes(&make()).await;
+    the_reported_version_is_the_one_put_returned(&make()).await;
+    the_version_follows_the_body(&make()).await;
     absent_objects_are_none(&make()).await;
     if_absent_rejects_an_existing_object(&make()).await;
     if_version_rejects_stale_writes(&make()).await;

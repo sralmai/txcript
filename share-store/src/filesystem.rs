@@ -11,14 +11,17 @@
 //!    would collide with a legal session name: publishing `notes` would
 //!    overwrite the transcript stored at `notes.attrs`.
 //! 2. **Versions.** There is no `ETag`, so one is derived from the content.
-//! 3. **Atomic conditional writes.** There is no compare-and-swap. See the
-//!    honesty note on [`Filesystem::put`].
+//! 3. **Atomic conditional writes.** There is no general compare-and-swap.
+//!    `IfAbsent` has one — `link` fails when the destination exists — but
+//!    `IfVersion` is still check-then-act. See the honesty note on
+//!    [`Filesystem::put`].
 //!
 //! Intended for local development, single-node deployments, and the
 //! conformance suite. Not for concurrent multi-writer use.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use txcript_share_core::Key;
 use txcript_share_core::plan::Precondition;
@@ -31,9 +34,11 @@ const OBJECTS: &str = "objects";
 const ATTRS: &str = "attrs";
 /// In-flight writes, renamed into place on completion.
 const TMP: &str = "tmp";
-/// The attribute name under which the version is persisted, so `head` and
-/// `list` never have to read a body to learn it.
-const VERSION_ATTR: &str = "\u{1}version";
+// The sidecar's first line is the version, so `head` and `list` never have to
+// read a body to learn it. It is deliberately not an attribute: riding inside
+// `Attrs` meant the caller's own metadata could push it past the byte budget
+// and silently drop or truncate it, leaving the object reporting a version
+// that was never its content's.
 
 /// Objects as files under a root, one directory per owner.
 #[derive(Debug, Clone)]
@@ -60,6 +65,18 @@ impl Filesystem {
         self.tree(ATTRS, key)
     }
 
+    /// A staging path no other in-flight write can be using.
+    fn staging(&self, key: &Key) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = format!(
+            "{}.{}.{}",
+            key.session(),
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        self.root.join(TMP).join(key.owner().as_str()).join(unique)
+    }
+
     fn tree(&self, tree: &str, key: &Key) -> PathBuf {
         self.root
             .join(tree)
@@ -67,50 +84,43 @@ impl Filesystem {
             .join(key.session())
     }
 
-    fn version_of(body: &[u8]) -> Version {
-        // FNV-1a. A content hash, so an unchanged rewrite keeps its version
-        // and `IfVersion` stays meaningful; not a cryptographic digest,
-        // which this does not need and would cost a dependency.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in body {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        Version::new(format!("\"{hash:016x}\""))
-    }
-
-    fn read_attrs(path: &Path) -> Attrs {
-        // A missing or corrupt sidecar degrades to no attributes rather than
-        // failing the listing: metadata is a cache of what is in the body.
+    /// The stored version and attributes. A missing or corrupt sidecar
+    /// degrades to neither rather than failing the listing: metadata is a
+    /// cache of what is in the body.
+    fn read_sidecar(path: &Path) -> (Option<Version>, Attrs) {
         let Ok(raw) = fs::read_to_string(path) else {
-            return Attrs::new();
+            return (None, Attrs::new());
         };
-        raw.lines()
-            .fold(Attrs::new(), |attrs, line| match line.split_once('\t') {
-                Some((name, value)) => attrs.set(name, value),
-                None => attrs,
-            })
+        let mut lines = raw.lines();
+        let version = lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .map(Version::new);
+        let attrs = lines.fold(Attrs::new(), |attrs, line| match line.split_once('\t') {
+            Some((name, value)) => attrs.set(name, value),
+            None => attrs,
+        });
+        (version, attrs)
     }
 
-    fn write_attrs(path: &Path, attrs: &Attrs) -> Result<(), StoreError> {
-        if attrs.is_empty() {
-            let _ = fs::remove_file(path);
-            return Ok(());
-        }
+    fn write_sidecar(path: &Path, version: &Version, attrs: &Attrs) -> Result<(), StoreError> {
         // The attrs tree mirrors the objects tree, so it needs its own
         // directories.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| StoreError::Backend(error.to_string()))?;
         }
-        // Tab-separated because attribute names are constrained and values
-        // are single-line; a JSON dependency is not worth it here.
-        let body = attrs.iter().fold(String::new(), |mut body, (name, value)| {
+        // Version first, on its own line, then tab-separated attributes:
+        // names are constrained and values are single-line, so a JSON
+        // dependency is not worth it here.
+        let mut body = String::new();
+        body.push_str(version.as_str());
+        body.push('\n');
+        for (name, value) in attrs.iter() {
             body.push_str(name);
             body.push('\t');
             body.push_str(&value.replace(['\n', '\t'], " "));
             body.push('\n');
-            body
-        });
+        }
         fs::write(path, body).map_err(|error| StoreError::Backend(error.to_string()))
     }
 
@@ -124,15 +134,12 @@ impl Filesystem {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(StoreError::Backend(error.to_string())),
         };
-        let stored = Self::read_attrs(&self.attrs_path_of(key));
-        let version = stored
-            .get(VERSION_ATTR)
-            .map_or_else(|| Version::new("\"unknown\""), Version::new);
+        let (stored, attrs) = Self::read_sidecar(&self.attrs_path_of(key));
         Ok(Some(ObjectMeta {
             key: key.clone(),
-            version,
+            version: stored.unwrap_or_else(|| Version::new("\"unknown\"")),
             size,
-            attrs: stored.without(VERSION_ATTR),
+            attrs,
         }))
     }
 
@@ -157,10 +164,14 @@ impl Filesystem {
 impl ObjectStore for Filesystem {
     /// # Honesty note
     ///
-    /// The precondition is checked and then the write happens; there is no
-    /// atomic compare-and-swap on a POSIX filesystem, so two concurrent
-    /// writers can both observe the same version and both proceed. `S3` and `R2`
-    /// do this atomically via `If-Match`.
+    /// `IfVersion` is checked and then the write happens, so two concurrent
+    /// writers can both observe the same version and both proceed. `S3` and
+    /// `R2` do this atomically via `If-Match`.
+    ///
+    /// `IfAbsent` *is* atomic here: the body is staged under a name no other
+    /// write can be using, then `link`ed into place, which fails when the
+    /// destination already exists. That is the one compare-and-swap POSIX
+    /// offers, and without it two racing creates were both told they won.
     ///
     /// This is stated rather than hidden because it is the seam doing its
     /// job: the trait can express a guarantee that one backend provides and
@@ -173,27 +184,44 @@ impl ObjectStore for Filesystem {
         attrs: &Attrs,
         precondition: &Precondition,
     ) -> Result<Version, StoreError> {
-        if !self.precondition_holds(key, precondition)? {
+        if !matches!(precondition, Precondition::IfAbsent)
+            && !self.precondition_holds(key, precondition)?
+        {
             return Err(StoreError::PreconditionFailed);
         }
         let path = self.path_of(key);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| StoreError::Backend(error.to_string()))?;
         }
-        // Write-then-rename so a reader never sees a half-written object.
-        let temp = self.tree(TMP, key);
+        // Write-then-rename so a reader never sees a half-written object. The
+        // staging name is unique per write: derived from the key, two
+        // concurrent writers shared one inode, and the object ended up with
+        // the loser's bytes while the winner was told its own had landed.
+        let temp = self.staging(key);
         if let Some(parent) = temp.parent() {
             fs::create_dir_all(parent).map_err(|error| StoreError::Backend(error.to_string()))?;
         }
         fs::write(&temp, body).map_err(|error| StoreError::Backend(error.to_string()))?;
-        fs::rename(&temp, &path).map_err(|error| StoreError::Backend(error.to_string()))?;
-        let version = Self::version_of(body);
-        // The version rides with the attributes so `head` and `list` never
-        // have to open the object.
-        Self::write_attrs(
-            &self.attrs_path_of(key),
-            &attrs.clone().set(VERSION_ATTR, version.as_str()),
-        )?;
+
+        if matches!(precondition, Precondition::IfAbsent) {
+            // `link` fails if the destination exists, which is the one
+            // compare-and-swap POSIX does give us — so a racing create is
+            // refused rather than both writers believing they won.
+            let linked = fs::hard_link(&temp, &path);
+            let _ = fs::remove_file(&temp);
+            match linked {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(StoreError::PreconditionFailed);
+                }
+                Err(error) => return Err(StoreError::Backend(error.to_string())),
+            }
+        } else {
+            fs::rename(&temp, &path).map_err(|error| StoreError::Backend(error.to_string()))?;
+        }
+
+        let version = crate::content_version(body);
+        Self::write_sidecar(&self.attrs_path_of(key), &version, attrs)?;
         Ok(version)
     }
 
