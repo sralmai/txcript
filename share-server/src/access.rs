@@ -180,7 +180,7 @@ impl Shared {
     fn publish(&self, fetched: Result<Vec<JsonWebKey>, String>) -> bool {
         let mut set = self.keys.write().unwrap_or_else(PoisonError::into_inner);
         match fetched {
-            Ok(keys) if keys.iter().any(|key| key.usable_for_rs256()) => {
+            Ok(keys) if keys.iter().any(JsonWebKey::usable_for_rs256) => {
                 set.keys = keys;
                 set.fetched = Some(Instant::now());
                 true

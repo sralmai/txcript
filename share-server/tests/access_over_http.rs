@@ -43,13 +43,29 @@ struct Server {
 }
 
 async fn serve(policy: Box<dyn Policy>) -> Server {
+    let limits = txcript_share_server::config::Limits::default();
+    serve_with(policy, limits).await
+}
+
+async fn serve_with_limit(policy: Box<dyn Policy>, max_document_bytes: usize) -> Server {
+    let limits = txcript_share_server::config::Limits {
+        max_document_bytes,
+        ..txcript_share_server::config::Limits::default()
+    };
+    serve_with(policy, limits).await
+}
+
+async fn serve_with(
+    policy: Box<dyn Policy>,
+    limits: txcript_share_server::config::Limits,
+) -> Server {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::Filesystem(Filesystem::new(dir.path()));
     let state = Arc::new(State {
         identity: tokens(),
         policy,
         store: store.clone(),
-        limits: txcript_share_server::config::Limits::default(),
+        limits,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -330,6 +346,41 @@ async fn a_teammate_can_read_what_a_teammate_published() {
     let (status, body) = request(&server.base, "GET", "/s", Some("bob-secret"), None).await;
     assert_eq!(status, 200);
     assert!(body.contains("alice/a"), "and must appear in the listing");
+}
+
+#[tokio::test]
+async fn a_document_up_to_the_configured_limit_is_publishable() {
+    // axum's own 2 MiB default used to cap this below the configured limit,
+    // so documents between the two were unpublishable and the handler's size
+    // check never ran for them. The limit under test is deliberately larger
+    // than that default.
+    let server = serve_with_limit(Box::new(OwnerPrefix), 4 * 1024 * 1024).await;
+    let padding = "x".repeat(3 * 1024 * 1024);
+    let doc = format!(r#"{{"messages":[{{"role":"user","content":"{padding}"}}]}}"#);
+
+    let (status, _) = request(
+        &server.base,
+        "PUT",
+        "/s/big",
+        Some("alice-secret"),
+        Some(&doc),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a 3 MiB document under a 4 MiB limit must land"
+    );
+
+    let (status, body) = request(
+        &server.base,
+        "GET",
+        "/s/alice/big",
+        Some("alice-secret"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), doc.len(), "and must come back whole");
 }
 
 #[tokio::test]
