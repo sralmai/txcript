@@ -31,7 +31,13 @@ let ready;
 export default {
   async fetch(request, env) {
     try {
-      ready ??= init(wasm);
+      // Not `??=`: that only reassigns on null/undefined, so a rejected
+      // promise stayed cached and pinned the isolate to 500 for its whole
+      // lifetime after one transient failure.
+      ready ??= init(wasm).catch((error) => {
+        ready = undefined;
+        throw error;
+      });
       await ready;
       return await route(request, env);
     } catch (error) {
@@ -157,11 +163,14 @@ async function listObjects(env, decision, principal) {
     });
     for (const object of page.objects) {
       entries.push({
+        // Stored metadata first: spread last, a key named `slug` or `team`
+        // would override the value derived from the R2 object, and the entry
+        // authorized could then differ from the entry rendered.
+        ...object.customMetadata,
         slug: object.key,
         etag: object.httpEtag,
         updated_at: object.uploaded.toISOString(),
         team: object.customMetadata?.team ?? null,
-        ...object.customMetadata,
       });
     }
     cursor = page.truncated ? page.cursor : undefined;
