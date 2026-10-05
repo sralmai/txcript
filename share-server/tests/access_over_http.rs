@@ -385,12 +385,23 @@ async fn a_document_up_to_the_configured_limit_is_publishable() {
 
 #[tokio::test]
 async fn a_traversal_slug_is_refused() {
+    // Each case must reach slug validation and be refused *by it*. Asserting
+    // only "some 4xx" let two of these pass on routing alone — a GET of
+    // `/s/<one-segment>` is a 405 because only PUT is mounted there, and a
+    // three-segment path matches no route at all — so they would have stayed
+    // green with `..` accepted as an owner.
     let server = serve(Box::new(OwnerPrefix)).await;
-    for path in ["/s/..%2F..%2Fetc%2Fpasswd", "/s/alice/..", "/s/../bob/x"] {
-        let (status, _) = request(&server.base, "GET", path, Some("alice-secret"), None).await;
+    for path in [
+        "/s/alice/..",
+        "/s/alice/..%2F..%2Fetc%2Fpasswd",
+        "/s/..%2F..%2Fetc%2Fpasswd/sess-1",
+        "/s/%2E%2E/bob",
+    ] {
+        let (status, body) = request(&server.base, "GET", path, Some("alice-secret"), None).await;
+        assert_eq!(status, 400, "{path} must be refused by slug validation");
         assert!(
-            (400..500).contains(&status),
-            "{path} must be refused, got {status}"
+            body.contains("malformed slug"),
+            "{path} must be refused for its slug, not incidentally: {body}"
         );
     }
 }
