@@ -154,6 +154,20 @@ fn an_owner_prefix_listing_needs_no_filtering() {
 }
 
 #[test]
+fn a_policy_that_permits_everything_has_no_spelling() {
+    // `AllowAll` is `share-core`'s double for the access matrix. The host
+    // must not be able to select it, so the value does not parse — which is
+    // a refusal on every request rather than a service with no write checks.
+    let out = planned(&json!({
+        "policy": "allow_all",
+        "principal": alice(),
+        "request": { "op": "delete", "slug": "bob/sess-1" },
+    }));
+    assert_eq!(out["do"], "reject");
+    assert_eq!(out["status"], 400);
+}
+
+#[test]
 fn garbage_in_is_a_rejection_not_a_panic_or_a_permission() {
     for input in [
         "",

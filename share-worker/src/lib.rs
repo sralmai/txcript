@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 use txcript_share_core::plan::{ObjectFacts, Plan, Precondition, Request, Status, decide};
 use txcript_share_core::policy::{
-    Action, AllowAll, ListScope, OwnerPrefix, Policy, ReadOnlyMirror, Target, TeamScoped,
+    Action, ListScope, OwnerPrefix, Policy, ReadOnlyMirror, Target, TeamScoped,
 };
 use txcript_share_core::{Key, Principal, PrincipalId, PrincipalKind};
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -36,9 +36,11 @@ pub enum PolicyChoice {
     OwnerPrefix,
     ReadOnlyMirror,
     TeamScoped,
-    /// Permits everything. Rejected unless the deployment opts in, because
-    /// shipping it by accident would disable every write check.
-    AllowAll,
+    // No `AllowAll`. It exists in `share-core` as the double the access
+    // matrix runs against, and deliberately has no spelling here: a host
+    // that cannot name it cannot be configured into permitting everything.
+    // `POLICY = "allow_all"` therefore fails to parse, which is a 400 on
+    // every request rather than an open service.
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,7 +242,6 @@ fn policy_of(input: &Input) -> Box<dyn Policy> {
     match input.policy {
         PolicyChoice::OwnerPrefix => Box::new(OwnerPrefix),
         PolicyChoice::ReadOnlyMirror => Box::new(ReadOnlyMirror),
-        PolicyChoice::AllowAll => Box::new(AllowAll),
         PolicyChoice::TeamScoped => {
             let policy = input
                 .teams
