@@ -190,6 +190,11 @@ force_path_style = true                                  # R2, MinIO, Ceph
 `AWS_REGION` must be set. The service needs one identity with read and write
 over the bucket; publishers do not need bucket credentials of their own.
 
+Credentials come from the ambient AWS chain, so an instance role or a
+Kubernetes service account needs nothing here. R2 and MinIO need static keys:
+pass them as environment variables — under NixOS through the module's
+`environmentFile`, in a container through `--env-file`.
+
 ### 3. Run it
 
 ```sh
@@ -213,6 +218,10 @@ service.
     enable = true;
     store = { kind = "filesystem"; root = "/var/lib/txcript-share"; };
     policy.kind = "owner_prefix";
+    # For `kind = "s3"` against R2 or MinIO, which need static keys: the AWS
+    # client reads its own credentials from the environment, and under
+    # DynamicUser there is no ~/.aws to find them in.
+    # environmentFile = config.age.secrets.s3-env.path;
   };
 
   services.txcript-share.cloudflareAccess = {
