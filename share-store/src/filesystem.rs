@@ -11,10 +11,9 @@
 //!    would collide with a legal session name: publishing `notes` would
 //!    overwrite the transcript stored at `notes.attrs`.
 //! 2. **Versions.** There is no `ETag`, so one is derived from the content.
-//! 3. **Atomic conditional writes.** There is no general compare-and-swap.
-//!    `IfAbsent` has one — `link` fails when the destination exists — but
-//!    `IfVersion` is still check-then-act. See the honesty note on
-//!    [`Filesystem::put`].
+//! 3. **Atomic conditional writes.** There is no general compare-and-swap, so
+//!    mutations are serialised within the process instead. See the honesty
+//!    note on [`Filesystem::put`].
 //!
 //! Intended for local development, single-node deployments, and the
 //! conformance suite. Not for concurrent multi-writer use.
@@ -22,6 +21,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use txcript_share_core::Key;
 use txcript_share_core::plan::Precondition;
@@ -44,12 +44,34 @@ const TMP: &str = "tmp";
 #[derive(Debug, Clone)]
 pub struct Filesystem {
     root: PathBuf,
+    /// Serialises mutations within this process.
+    ///
+    /// An object is a body file *and* a sidecar, so a write is two file
+    /// operations and cannot be made atomic by staging alone: two writers can
+    /// each land their own body and then their own sidecar in the other's
+    /// order, leaving one writer's bytes under the other's version. Shared
+    /// across clones, so the handles a host hands out contend with each other.
+    ///
+    /// Within one process this also makes `IfVersion` a real
+    /// compare-and-swap. Across processes neither holds, which is what the
+    /// module header means by single-node.
+    writes: Arc<Mutex<()>>,
 }
 
 impl Filesystem {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            writes: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// The mutation lock, recovered rather than propagated: a panic mid-write
+    /// leaves files, not invariants, in whatever state it reached, and
+    /// refusing every later write would be the larger failure.
+    fn locked(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `<root>/objects/<owner>/<session>`. `Key` guarantees both segments
@@ -164,14 +186,18 @@ impl Filesystem {
 impl ObjectStore for Filesystem {
     /// # Honesty note
     ///
-    /// `IfVersion` is checked and then the write happens, so two concurrent
-    /// writers can both observe the same version and both proceed. `S3` and
-    /// `R2` do this atomically via `If-Match`.
+    /// An object is two files — a body and a sidecar — so a write cannot be
+    /// made atomic by staging alone. Mutations are therefore serialised by a
+    /// lock this store shares across its clones, which is what makes a
+    /// version always describe the body stored beside it, and makes
+    /// `IfVersion` a real compare-and-swap. `S3` and `R2` get both from
+    /// `If-Match`, across every client.
     ///
-    /// `IfAbsent` *is* atomic here: the body is staged under a name no other
-    /// write can be using, then `link`ed into place, which fails when the
-    /// destination already exists. That is the one compare-and-swap POSIX
-    /// offers, and without it two racing creates were both told they won.
+    /// The lock is per *process*. Two servers over one directory have neither
+    /// guarantee, which is what the module header means by single-node.
+    /// `IfAbsent` is the exception that holds regardless: the body is staged
+    /// under a name no other write can be using, then `link`ed into place,
+    /// which fails when the destination already exists.
     ///
     /// This is stated rather than hidden because it is the seam doing its
     /// job: the trait can express a guarantee that one backend provides and
@@ -184,6 +210,7 @@ impl ObjectStore for Filesystem {
         attrs: &Attrs,
         precondition: &Precondition,
     ) -> Result<Version, StoreError> {
+        let _writing = self.locked();
         if !matches!(precondition, Precondition::IfAbsent)
             && !self.precondition_holds(key, precondition)?
         {
@@ -242,6 +269,7 @@ impl ObjectStore for Filesystem {
     }
 
     async fn delete(&self, key: &Key, precondition: &Precondition) -> Result<(), StoreError> {
+        let _writing = self.locked();
         if !self.precondition_holds(key, precondition)? {
             return Err(StoreError::PreconditionFailed);
         }

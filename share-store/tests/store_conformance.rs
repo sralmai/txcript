@@ -185,7 +185,7 @@ fn concurrent_writers_cannot_leave_a_version_that_is_not_the_content() {
     let k = conformance::key("alice", "contested");
     let bodies = [vec![b'a'; 8 * 1024 * 1024], vec![b'b'; 8 * 1024 * 1024]];
 
-    for _ in 0..10 {
+    for _ in 0..40 {
         let reported = race(&store, &k, &bodies, &Precondition::None);
         let stored = block_on(store.get(&k)).expect("get").expect("present");
         let Some(whose) = bodies.iter().position(|body| *body == stored.body) else {
@@ -209,7 +209,7 @@ fn concurrent_writers_cannot_leave_a_version_that_is_not_the_content() {
 /// Only one of two racing creates may be told it succeeded.
 #[test]
 fn only_one_racing_create_can_win() {
-    for _ in 0..20 {
+    for _ in 0..40 {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Filesystem::new(dir.path());
         let k = conformance::key("alice", "created-once");
