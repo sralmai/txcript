@@ -31,7 +31,13 @@ let ready;
 export default {
   async fetch(request, env) {
     try {
-      ready ??= init(wasm);
+      // Not `??=`: that only reassigns on null/undefined, so a rejected
+      // promise stayed cached and pinned the isolate to 500 for its whole
+      // lifetime after one transient failure.
+      ready ??= init(wasm).catch((error) => {
+        ready = undefined;
+        throw error;
+      });
       await ready;
       return await route(request, env);
     } catch (error) {
@@ -121,9 +127,13 @@ async function writeObject(request, env, decision) {
   const doc = parseSimple(text);
   if (!doc) return json({ error: "body is not a Simple transcript document" }, 400);
 
+  const customMetadata = summarize(doc);
+  // From the plan, not the document: a publisher must not choose the team its
+  // transcript counts as belonging to.
+  if (decision.team) customMetadata.team = decision.team;
   const options = {
     httpMetadata: { contentType: "application/json" },
-    customMetadata: summarize(doc),
+    customMetadata,
   };
   // The core decided the concurrency rule; this only applies it.
   if (decision.precondition.kind === "if_absent") {
@@ -153,11 +163,14 @@ async function listObjects(env, decision, principal) {
     });
     for (const object of page.objects) {
       entries.push({
+        // Stored metadata first: spread last, a key named `slug` or `team`
+        // would override the value derived from the R2 object, and the entry
+        // authorized could then differ from the entry rendered.
+        ...object.customMetadata,
         slug: object.key,
         etag: object.httpEtag,
         updated_at: object.uploaded.toISOString(),
         team: object.customMetadata?.team ?? null,
-        ...object.customMetadata,
       });
     }
     cursor = page.truncated ? page.cursor : undefined;

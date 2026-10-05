@@ -156,6 +156,36 @@ impl Auth for EnvHeaders {
     }
 }
 
+/// Percent-encode one path segment.
+///
+/// Session ids are copied verbatim out of other agents' files, and
+/// `checked_id_component` only rejects what would be unsafe as a *file* name —
+/// `#`, `?` and `%` all pass it. Interpolated raw, a `#` truncates the URL and
+/// the transcript publishes under a different key than the caller named. Both
+/// hosts decode escapes, so encoding here is the whole fix.
+fn encoded_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    out
+}
+
+/// The same, for an `<owner>/<session>` slug: the separator stays a separator.
+fn encoded_slug(slug: &str) -> String {
+    slug.split('/')
+        .map(encoded_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 // --- the store --------------------------------------------------------
 
 /// A published transcript: its slug (`<owner>/<session>`) and the service's
@@ -211,10 +241,7 @@ impl ShareStore {
     }
 
     fn request(&self, method: http::Method, path: &str, body: Vec<u8>) -> Result<http::Response> {
-        let mut sensitive = Vec::new();
-        for (name, value) in self.auth.headers()? {
-            sensitive.push((leak(name), value));
-        }
+        let sensitive = self.auth.headers()?;
         let response = self.agent.send(http::Request {
             method,
             url: format!("{}{path}", self.base_url),
@@ -235,16 +262,6 @@ impl ShareStore {
             ));
         }
         Ok(response)
-    }
-}
-
-/// `http::Request` names headers with `&'static str`. Auth providers produce
-/// names at runtime, so an owned name is leaked once, at startup scale —
-/// bounded by how many distinct headers a deployment configures.
-fn leak(name: Cow<'static, str>) -> &'static str {
-    match name {
-        Cow::Borrowed(name) => name,
-        Cow::Owned(name) => Box::leak(name.into_boxed_str()),
     }
 }
 
@@ -375,7 +392,7 @@ impl Store for ShareStore {
     fn load(&self, reference: &ShareRef) -> Result<Transcript<Share>> {
         let response = self.request(
             http::Method::Get,
-            &format!("/s/{}", reference.slug),
+            &format!("/s/{}", encoded_slug(&reference.slug)),
             Vec::new(),
         )?;
         check(&response)?;
@@ -406,7 +423,7 @@ impl Store for ShareStore {
         let body = Share::to_text(transcript)?;
         let response = self.request(
             http::Method::Put,
-            &format!("/s/{}", transcript.meta.id),
+            &format!("/s/{}", encoded_segment(&transcript.meta.id)),
             body.into_bytes(),
         )?;
         check(&response)?;
@@ -428,7 +445,7 @@ impl Store for ShareStore {
         }
         let response = self.request(
             http::Method::Delete,
-            &format!("/s/{}", reference.slug),
+            &format!("/s/{}", encoded_slug(&reference.slug)),
             Vec::new(),
         )?;
         check(&response)
@@ -554,6 +571,20 @@ mod tests {
         for bad in ["no-colon", ": value", "name:", ""] {
             assert!(parse_header(bad).is_none(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn path_segments_are_encoded_so_an_id_cannot_truncate_the_url() {
+        // `checked_id_component` lets these through: they are safe file names.
+        // Raw in a URL, `#` starts a fragment and `?` a query, so the
+        // transcript would publish under a shorter key than the caller named.
+        assert_eq!(encoded_segment("sess-1"), "sess-1");
+        assert_eq!(encoded_segment("a#b"), "a%23b");
+        assert_eq!(encoded_segment("a?b"), "a%3Fb");
+        assert_eq!(encoded_segment("a b"), "a%20b");
+        assert_eq!(encoded_segment("100%"), "100%25");
+        // The slug separator stays one; the segments around it do not.
+        assert_eq!(encoded_slug("alice/a#b"), "alice/a%23b");
     }
 
     #[test]

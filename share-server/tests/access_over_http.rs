@@ -43,13 +43,29 @@ struct Server {
 }
 
 async fn serve(policy: Box<dyn Policy>) -> Server {
+    let limits = txcript_share_server::config::Limits::default();
+    serve_with(policy, limits).await
+}
+
+async fn serve_with_limit(policy: Box<dyn Policy>, max_document_bytes: usize) -> Server {
+    let limits = txcript_share_server::config::Limits {
+        max_document_bytes,
+        ..txcript_share_server::config::Limits::default()
+    };
+    serve_with(policy, limits).await
+}
+
+async fn serve_with(
+    policy: Box<dyn Policy>,
+    limits: txcript_share_server::config::Limits,
+) -> Server {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::Filesystem(Filesystem::new(dir.path()));
     let state = Arc::new(State {
         identity: tokens(),
         policy,
         store: store.clone(),
-        limits: txcript_share_server::config::Limits::default(),
+        limits,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -308,13 +324,84 @@ async fn a_team_policy_hides_other_teams_from_a_listing() {
 }
 
 #[tokio::test]
+async fn a_teammate_can_read_what_a_teammate_published() {
+    // The case the policy exists for, and the one nothing covered: both
+    // principals in *one* team. It only works if the team was recorded at
+    // publish time, because the read decision reads it back off the object.
+    // With the two principals in different teams — as the listing test has
+    // them — a policy that recorded nothing is indistinguishable from one
+    // that works.
+    let policy = TeamScoped::new()
+        .with(PrincipalId::new("alice").expect("id"), "red")
+        .with(PrincipalId::new("bob").expect("id"), "red");
+    let server = serve(Box::new(policy)).await;
+
+    let (status, _) = request(&server.base, "PUT", "/s/a", Some("alice-secret"), Some(DOC)).await;
+    assert_eq!(status, 201);
+
+    let (status, body) = request(&server.base, "GET", "/s/alice/a", Some("bob-secret"), None).await;
+    assert_eq!(status, 200, "a teammate's transcript must be readable");
+    assert!(body.contains("Fix the parser"));
+
+    let (status, body) = request(&server.base, "GET", "/s", Some("bob-secret"), None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("alice/a"), "and must appear in the listing");
+}
+
+#[tokio::test]
+async fn a_document_up_to_the_configured_limit_is_publishable() {
+    // axum's own 2 MiB default used to cap this below the configured limit,
+    // so documents between the two were unpublishable and the handler's size
+    // check never ran for them. The limit under test is deliberately larger
+    // than that default.
+    let server = serve_with_limit(Box::new(OwnerPrefix), 4 * 1024 * 1024).await;
+    let padding = "x".repeat(3 * 1024 * 1024);
+    let doc = format!(r#"{{"messages":[{{"role":"user","content":"{padding}"}}]}}"#);
+
+    let (status, _) = request(
+        &server.base,
+        "PUT",
+        "/s/big",
+        Some("alice-secret"),
+        Some(&doc),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a 3 MiB document under a 4 MiB limit must land"
+    );
+
+    let (status, body) = request(
+        &server.base,
+        "GET",
+        "/s/alice/big",
+        Some("alice-secret"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), doc.len(), "and must come back whole");
+}
+
+#[tokio::test]
 async fn a_traversal_slug_is_refused() {
+    // Each case must reach slug validation and be refused *by it*. Asserting
+    // only "some 4xx" let two of these pass on routing alone — a GET of
+    // `/s/<one-segment>` is a 405 because only PUT is mounted there, and a
+    // three-segment path matches no route at all — so they would have stayed
+    // green with `..` accepted as an owner.
     let server = serve(Box::new(OwnerPrefix)).await;
-    for path in ["/s/..%2F..%2Fetc%2Fpasswd", "/s/alice/..", "/s/../bob/x"] {
-        let (status, _) = request(&server.base, "GET", path, Some("alice-secret"), None).await;
+    for path in [
+        "/s/alice/..",
+        "/s/alice/..%2F..%2Fetc%2Fpasswd",
+        "/s/..%2F..%2Fetc%2Fpasswd/sess-1",
+        "/s/%2E%2E/bob",
+    ] {
+        let (status, body) = request(&server.base, "GET", path, Some("alice-secret"), None).await;
+        assert_eq!(status, 400, "{path} must be refused by slug validation");
         assert!(
-            (400..500).contains(&status),
-            "{path} must be refused, got {status}"
+            body.contains("malformed slug"),
+            "{path} must be refused for its slug, not incidentally: {body}"
         );
     }
 }

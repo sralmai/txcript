@@ -109,7 +109,12 @@ pub fn discover_with(mut on_store: impl FnMut(HarnessId, usize)) -> Vec<Session>
     #[cfg(feature = "share")]
     {
         on_store(HarnessId::Share, out.len());
-        let _ = discover_share_into(&mut out);
+        // Reported, not discarded: an unreachable endpoint and an empty one
+        // are different answers, and swallowing the error made a 30s stall
+        // followed by nothing indistinguishable from "nobody published".
+        if let Err(error) = discover_share_into(&mut out) {
+            eprintln!("txcript: share store unavailable: {error}");
+        }
     }
     // Live web harnesses are deliberately excluded from aggregate discovery.
     on_store(HarnessId::Codex, out.len());
@@ -263,9 +268,13 @@ pub fn discover_harness(harness: HarnessId) -> Result<Vec<Session>> {
 }
 
 /// The sessions a `--from` selection names: every local harness when
-/// `from` is `None`, else that one harness. This is the only path that
-/// reaches a live web source, and only when it is named explicitly — an omitted
-/// `from` never contacts either one.
+/// `from` is `None`, else that one harness.
+///
+/// A live web source is reached only when named explicitly. A configured share
+/// store is the exception and does join the unnamed case, because listing what
+/// others published is the point of it — so an omitted `from` contacts the
+/// network exactly when a share endpoint is configured, and reports on stderr
+/// if it cannot be reached.
 ///
 /// # Errors
 /// When the explicitly selected live backend rejects access or changes shape.
@@ -1177,8 +1186,15 @@ fn apply_resume_template(template: &str, id: &str) -> Option<(String, Vec<String
 fn configured_share() -> Result<share::ConfiguredStore> {
     share::from_env()?.ok_or_else(|| Error::Remote {
         harness: "share",
-        detail: "no share store is configured (set TXCRIPT_SHARE_URL or TXCRIPT_SHARE_BUCKET)"
-            .to_string(),
+        // Naming the bucket variable in a build without `share_s3` sends the
+        // reader to a second, different error.
+        detail: if cfg!(feature = "share_s3") {
+            "no share store is configured (set TXCRIPT_SHARE_URL, or \
+             TXCRIPT_SHARE_BUCKET to publish straight to a bucket)"
+        } else {
+            "no share store is configured (set TXCRIPT_SHARE_URL)"
+        }
+        .to_string(),
     })
 }
 

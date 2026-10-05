@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use txcript_share_core::identity::{ForwardedClientCert, Identity, StaticTokens};
-use txcript_share_core::policy::{AllowAll, OwnerPrefix, Policy, ReadOnlyMirror, TeamScoped};
+use txcript_share_core::policy::{OwnerPrefix, Policy, ReadOnlyMirror, TeamScoped};
 use txcript_share_core::{Principal, PrincipalId, PrincipalKind};
 
 #[derive(Debug, Deserialize)]
@@ -103,12 +103,12 @@ pub enum StoreConfig {
 pub enum PolicyConfig {
     OwnerPrefix,
     ReadOnlyMirror,
-    TeamScoped {
-        members: Vec<TeamMember>,
-    },
-    /// Permits everything. Never for a deployment; present so the test
-    /// harness can isolate transport bugs from policy bugs.
-    AllowAll,
+    TeamScoped { members: Vec<TeamMember> },
+    // No `AllowAll`. It is `share-core`'s test double, and giving it a
+    // spelling here would make "permit everything" one typo away in a file
+    // that is otherwise all security-relevant. `kind = "allow_all"` is an
+    // unknown variant, so the service refuses to start rather than starting
+    // with no write checks.
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,12 +123,28 @@ pub struct TeamMember {
 pub struct Limits {
     #[serde(default = "default_max_document_bytes")]
     pub max_document_bytes: usize,
-    #[serde(default = "default_page_size")]
+    /// Rejected at zero: every backend reports an empty page for a limit of
+    /// zero, so the service would answer "you have no transcripts" with a 200,
+    /// forever. A plausible misreading of "unlimited" must not be silent.
+    #[serde(default = "default_page_size", deserialize_with = "at_least_one")]
     pub page_size: usize,
 }
 
 const fn default_max_document_bytes() -> usize {
     10 * 1024 * 1024
+}
+
+fn at_least_one<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "page_size must be at least 1; zero reports every listing as empty",
+        ));
+    }
+    Ok(value)
 }
 
 const fn default_page_size() -> usize {
@@ -257,7 +273,6 @@ impl PolicyConfig {
         Ok(match self {
             PolicyConfig::OwnerPrefix => Box::new(OwnerPrefix),
             PolicyConfig::ReadOnlyMirror => Box::new(ReadOnlyMirror),
-            PolicyConfig::AllowAll => Box::new(AllowAll),
             PolicyConfig::TeamScoped { members } => {
                 let mut policy = TeamScoped::new();
                 for member in members {
@@ -346,6 +361,43 @@ mod tests {
             aud_file: aud,
         };
         assert!(matches!(identity.build(), Err(ConfigError::Credentials(_))));
+    }
+
+    #[test]
+    fn a_policy_that_permits_everything_cannot_be_configured() {
+        // The double lives in `share-core` for the access matrix. A
+        // deployment must not be able to name it, so this is a startup
+        // failure rather than a service with no write checks.
+        let bad = toml::from_str::<Config>(
+            r#"
+            [identity]
+            kind = "forwarded_header"
+            header = "x-forwarded-user"
+            [store]
+            kind = "memory"
+            [policy]
+            kind = "allow_all"
+            "#,
+        );
+        assert!(bad.is_err(), "a deployment must not be able to name it");
+    }
+
+    #[test]
+    fn a_page_size_of_zero_is_refused_rather_than_reporting_an_empty_store() {
+        let bad = toml::from_str::<Config>(
+            r#"
+            [identity]
+            kind = "forwarded_header"
+            header = "x-forwarded-user"
+            [store]
+            kind = "memory"
+            [policy]
+            kind = "owner_prefix"
+            [limits]
+            page_size = 0
+            "#,
+        );
+        assert!(bad.is_err(), "zero would make every listing silently empty");
     }
 
     #[test]

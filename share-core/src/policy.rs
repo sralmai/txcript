@@ -114,6 +114,17 @@ pub trait Policy: Send + Sync {
     /// How a listing must be scoped and, where a prefix is insufficient,
     /// filtered.
     fn list_scope(&self, who: &Principal, scope: ListScope) -> ListPlan;
+
+    /// The team to record on an object this principal publishes, for the
+    /// policies whose decisions read it back.
+    ///
+    /// Returned by the policy rather than taken from the document, because a
+    /// publisher must not be able to choose the team its transcript counts as
+    /// belonging to. Default `None`: most policies decide from the key alone
+    /// and have nothing to record.
+    fn team_of(&self, _who: &Principal) -> Option<String> {
+        None
+    }
 }
 
 /// Read anyone's, write only your own. The shipped policy.
@@ -193,7 +204,7 @@ impl TeamScoped {
         self
     }
 
-    fn team_of(&self, who: &PrincipalId) -> Option<&str> {
+    fn lookup(&self, who: &PrincipalId) -> Option<&str> {
         self.members
             .iter()
             .find(|(id, _)| id == who)
@@ -211,7 +222,7 @@ impl Policy for TeamScoped {
     fn authorize(&self, who: &Principal, action: Action, target: &Target) -> Decision {
         match action {
             Action::Read => {
-                let mine = self.team_of(&who.id);
+                let mine = self.lookup(&who.id);
                 // An object with no recorded team is readable only by its
                 // owner: failing closed is the right default for metadata
                 // that predates the policy.
@@ -240,6 +251,10 @@ impl Policy for TeamScoped {
             // an earlier version leaked every team's keys and titles.
             ListScope::Everyone => ListPlan::filtered(KeyPrefix::everything()),
         }
+    }
+
+    fn team_of(&self, who: &Principal) -> Option<String> {
+        self.lookup(&who.id).map(str::to_string)
     }
 }
 

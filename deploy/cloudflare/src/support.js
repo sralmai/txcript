@@ -139,21 +139,31 @@ export async function callerPrincipal(request, env) {
   return { id: await principalId(identity), label: identity, service: !claims.email };
 }
 
-let jwksCache = { at: 0, keys: null };
+let jwksCache = { at: 0, keys: null, forcedAt: 0 };
+
+/// The floor between forced refetches. Without it an unauthenticated caller
+/// presenting a fresh `kid` each time drove one outbound certs request per
+/// request — an amplifier pointed at Cloudflare, reachable before any
+/// signature had been checked.
+const FORCED_REFETCH_FLOOR_MS = 30_000;
 
 async function accessKeys(env, force = false) {
+  if (force && Date.now() - jwksCache.forcedAt < FORCED_REFETCH_FLOOR_MS) {
+    return jwksCache.keys ?? [];
+  }
+  if (force) jwksCache.forcedAt = Date.now();
   if (!force && jwksCache.keys && Date.now() - jwksCache.at < JWKS_TTL_MS) return jwksCache.keys;
   const url =
     env.ACCESS_CERTS_URL ?? `https://${env.ACCESS_TEAM}.cloudflareaccess.com/cdn-cgi/access/certs`;
   const response = await fetch(url);
   if (!response.ok) throw new Error(`fetching Access certs: ${response.status}`);
   const { keys } = await response.json();
-  jwksCache = { at: Date.now(), keys };
+  jwksCache = { at: Date.now(), keys, forcedAt: jwksCache.forcedAt };
   return keys;
 }
 
 export function resetJwksCacheForTests() {
-  jwksCache = { at: 0, keys: null };
+  jwksCache = { at: 0, keys: null, forcedAt: 0 };
 }
 
 export async function verifyAccessJwt(token, env) {
@@ -189,7 +199,17 @@ export async function verifyAccessJwt(token, env) {
       return null;
     }
     const claims = JSON.parse(decodeText(payload64));
-    if (typeof claims.exp !== "number" || claims.exp * 1000 <= Date.now()) return null;
+    const now = Date.now();
+    if (typeof claims.exp !== "number" || claims.exp * 1000 <= now) return null;
+    // `nbf`/`iat` when present, so this origin is not more permissive than the
+    // Access edge in front of it.
+    if (typeof claims.nbf === "number" && claims.nbf * 1000 > now) return null;
+    if (typeof claims.iat === "number" && claims.iat * 1000 > now) return null;
+    // A deployment with no AUD configured must refuse, not match. `[undefined]
+    // .includes(undefined)` is true, so an unset variable used to turn the
+    // audience check — the lock behind the Access gate — into a no-op for any
+    // token that carried no `aud` of its own.
+    if (!env.ACCESS_AUD) return null;
     const audience = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
     return audience.includes(env.ACCESS_AUD) ? claims : null;
   } catch {

@@ -930,8 +930,13 @@ mod remote {
         headers: Vec<(&'static str, String)>,
         max_bytes: u64,
     ) -> http::Request {
-        let mut sensitive = vec![("cookie", cookie)];
-        sensitive.extend(headers);
+        let mut sensitive: Vec<(std::borrow::Cow<'static, str>, String)> =
+            vec![("cookie".into(), cookie)];
+        sensitive.extend(
+            headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value)),
+        );
         http::Request {
             method: http::Method::Get,
             body: Vec::new(),

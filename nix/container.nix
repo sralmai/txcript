@@ -22,6 +22,11 @@ dockerTools.buildLayeredImage {
   ];
 
   config = {
+    # Unprivileged. The process binds 8787 and reads one configuration file,
+    # so it never needs root — while the NixOS path for the same binary is
+    # careful to use `DynamicUser`. `nobody`, because the image has no
+    # /etc/passwd to name anyone else.
+    User = "65534:65534";
     Entrypoint = [ (lib.getExe share-server) ];
     # Overridable: `docker run … image /path/to/other.toml`.
     Cmd = [ "/etc/txcript-share/config.toml" ];

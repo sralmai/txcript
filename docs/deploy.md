@@ -190,6 +190,11 @@ force_path_style = true                                  # R2, MinIO, Ceph
 `AWS_REGION` must be set. The service needs one identity with read and write
 over the bucket; publishers do not need bucket credentials of their own.
 
+Credentials come from the ambient AWS chain, so an instance role or a
+Kubernetes service account needs nothing here. R2 and MinIO need static keys:
+pass them as environment variables — under NixOS through the module's
+`environmentFile`, in a container through `--env-file`.
+
 ### 3. Run it
 
 ```sh
@@ -213,6 +218,10 @@ service.
     enable = true;
     store = { kind = "filesystem"; root = "/var/lib/txcript-share"; };
     policy.kind = "owner_prefix";
+    # For `kind = "s3"` against R2 or MinIO, which need static keys: the AWS
+    # client reads its own credentials from the environment, and under
+    # DynamicUser there is no ~/.aws to find them in.
+    # environmentFile = config.age.secrets.s3-env.path;
   };
 
   services.txcript-share.cloudflareAccess = {
@@ -340,12 +349,12 @@ rather than a silent preference.
 | `owner_prefix` (default) | read everyone's, write only your own |
 | `read_only_mirror` | everyone reads, nobody writes |
 | `team_scoped` | read within your team, write only your own |
-| `allow_all` | everything — for tests, never for a deployment |
 
-No policy, including `allow_all`, can produce a cross-owner write: `PUT`
-takes a bare session id and the owner segment comes from the authenticated
-principal, so writing outside your own namespace is not expressible rather
-than merely denied.
+No policy can produce a cross-owner write: `PUT` takes a bare session id and
+the owner segment comes from the authenticated principal, so writing outside
+your own namespace is not expressible rather than merely denied. The
+permit-everything policy used to isolate transport bugs in tests has no
+spelling in either host's configuration, so it cannot be selected by accident.
 
 `team_scoped` needs `<principal-id>:<team>` pairs. A principal id is the
 SHA-256 of the Access identity — an email for an SSO login, the

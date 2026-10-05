@@ -180,10 +180,18 @@ impl Shared {
     fn publish(&self, fetched: Result<Vec<JsonWebKey>, String>) -> bool {
         let mut set = self.keys.write().unwrap_or_else(PoisonError::into_inner);
         match fetched {
-            Ok(keys) => {
+            Ok(keys) if keys.iter().any(JsonWebKey::usable_for_rs256) => {
                 set.keys = keys;
                 set.fetched = Some(Instant::now());
                 true
+            }
+            // Readable but unverifiable is not a key set. Treating it as
+            // current would answer every request with 401 for a whole TTL —
+            // the caller's fault, when nothing the caller sent was wrong.
+            // The keys we already hold stay, and the retry interval applies.
+            Ok(_) => {
+                eprintln!("Access key set: no usable RS256 key; keeping the previous set");
+                false
             }
             Err(detail) => {
                 // Logged here because the request path cannot: it reports
@@ -684,6 +692,14 @@ mod tests {
         }
     }
 
+    /// A key the verifier must not count: right shape, wrong algorithm.
+    fn wrong_kind(kid: &str) -> JsonWebKey {
+        JsonWebKey {
+            kty: "EC".to_string(),
+            ..jwk(kid, KEY_A_N)
+        }
+    }
+
     fn presented(token: &str) -> Headers {
         Headers::new().with(HEADER, token)
     }
@@ -905,6 +921,54 @@ mod tests {
             label_of(&identity, &token),
             Ok(Some("alice@example.com".to_string())),
             "a refresh failure must not revoke keys that still verify honest tokens"
+        );
+    }
+
+    #[test]
+    fn a_key_set_with_nothing_usable_is_not_treated_as_current() {
+        // A document we could read but cannot verify with is not a key set.
+        // Counting it as current would answer every request with 401 for a
+        // whole TTL — the caller's fault, when the caller did nothing wrong —
+        // and the refresher would sleep instead of retrying.
+        for unusable in [Vec::new(), vec![wrong_kind("k1")]] {
+            let published = Published::new(unusable);
+            let identity = eager_verifier(published.clone());
+            let token = sign(&key_pair(KEY_A), "k1", &sso("alice@example.com"));
+
+            assert!(
+                label_of(&identity, &token).is_err(),
+                "an unusable key set is our problem, not the caller's"
+            );
+            // Retrying, rather than sleeping out the healthy interval.
+            published.awaits_fetch(3);
+
+            published.set(Ok(vec![jwk("k1", KEY_A_N)]));
+            let swapped = published.fetches();
+            published.awaits_fetch(swapped + 2);
+            assert_eq!(
+                label_of(&identity, &token),
+                Ok(Some("alice@example.com".to_string())),
+                "and it recovers on the refresher's own schedule"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unusable_refresh_keeps_the_keys_already_held() {
+        let published = Published::new(vec![jwk("k1", KEY_A_N)]);
+        let identity = eager_verifier(published.clone());
+        let token = sign(&key_pair(KEY_A), "k1", &sso("alice@example.com"));
+        assert_eq!(
+            label_of(&identity, &token),
+            Ok(Some("alice@example.com".to_string()))
+        );
+
+        published.set(Ok(Vec::new()));
+        published.awaits_fetch(3);
+        assert_eq!(
+            label_of(&identity, &token),
+            Ok(Some("alice@example.com".to_string())),
+            "an empty document must not revoke keys that still verify"
         );
     }
 
