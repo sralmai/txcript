@@ -568,14 +568,18 @@ mod remote {
             })
         }
 
-        fn headers(&self) -> Vec<(&'static str, String)> {
-            let mut headers = vec![(
-                "authorization",
-                format!("Bearer {}", self.credentials.access_token),
-            )];
-            headers.push(("chatgpt-account-id", self.credentials.account_id.clone()));
-            headers.push(("originator", "txcript".to_string()));
-            headers
+        fn headers(&self) -> Vec<(std::borrow::Cow<'static, str>, String)> {
+            vec![
+                (
+                    "authorization".into(),
+                    format!("Bearer {}", self.credentials.access_token),
+                ),
+                (
+                    "chatgpt-account-id".into(),
+                    self.credentials.account_id.clone(),
+                ),
+                ("originator".into(), "txcript".to_string()),
+            ]
         }
 
         fn get_json(&self, path: &str) -> Result<Value> {
