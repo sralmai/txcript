@@ -29,7 +29,7 @@
 //! ([`crate::Catalog`]) is the answer when it starts to hurt.
 
 use aws_sdk_s3::Client;
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Object as S3Object;
 use txcript_share_core::Key;
@@ -88,14 +88,20 @@ impl S3 {
 }
 
 /// S3 reports a failed precondition as 412, and a failed `If-None-Match: *`
-/// as 409. Both mean "someone else got there first", which is the caller's
-/// business rather than an outage.
-fn classify<E: std::fmt::Debug>(error: &SdkError<E>) -> StoreError {
+/// as 409 `ConditionalRequestConflict`. Both mean "someone else got there
+/// first", which is the caller's business rather than an outage.
+///
+/// The 409 is matched on its code rather than its status: `OperationAborted`
+/// is also a 409 and is *not* a precondition failure, so reporting it as one
+/// told a caller its object had changed when it had sent no precondition.
+fn classify<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkError<E>) -> StoreError {
     let status = match error {
         SdkError::ServiceError(inner) => inner.raw().status().as_u16(),
         _ => 0,
     };
-    if matches!(status, 409 | 412) {
+    let conflicted =
+        status == 412 || (status == 409 && error.code() == Some("ConditionalRequestConflict"));
+    if conflicted {
         StoreError::PreconditionFailed
     } else {
         StoreError::Backend(format!("{error:?}"))
@@ -235,14 +241,29 @@ impl ObjectStore for S3 {
         }
         let response = request.send().await.map_err(|error| classify(&error))?;
 
-        let found: Vec<&S3Object> = response.contents().iter().collect();
+        let found: &[S3Object] = response.contents();
+        // Whether more remains is the service's answer, not an inference from
+        // how many entries survived. `ListObjectsV2` may return fewer keys
+        // than `max_keys` and still be truncated, and entries are dropped
+        // locally too — a bucket key that is not a slug, or a HEAD that races
+        // a delete. Counting survivors ended the listing on any shortfall and
+        // silently lost the tail.
+        let truncated = response.is_truncated().unwrap_or(false);
         let mut objects = Vec::with_capacity(found.len().min(limit));
+        // The cursor advances over entries that were skipped as well as kept,
+        // or a key that never yields an object would be asked for forever.
+        let mut last_seen = None;
+        let mut consumed = 0;
         for entry in found {
-            let Some(key) = entry
-                .key()
-                .and_then(|raw| Self::slug_of(&self.root, raw))
-                .and_then(Key::parse)
-            else {
+            if objects.len() == limit {
+                break;
+            }
+            consumed += 1;
+            let Some(slug) = entry.key().and_then(|raw| Self::slug_of(&self.root, raw)) else {
+                continue;
+            };
+            last_seen = Some(slug.to_string());
+            let Some(key) = Key::parse(slug) else {
                 continue;
             };
             // `ListObjectsV2` does not return user metadata, so attributes
@@ -259,16 +280,20 @@ impl ObjectStore for S3 {
             ));
         }
 
-        let next = if objects.len() > limit {
-            objects.truncate(limit);
-            objects.last().map(|meta| Cursor(meta.key.to_slug()))
-        } else {
-            None
-        };
+        let more = truncated || consumed < found.len();
+        let next = if more { last_seen.map(Cursor) } else { None };
         Ok(Page { objects, next })
     }
 }
 
-fn is_missing<E: std::fmt::Debug>(error: &SdkError<E>) -> bool {
-    matches!(error, SdkError::ServiceError(inner) if inner.raw().status().as_u16() == 404)
+/// Whether a 404 means *this key* is absent.
+///
+/// `NoSuchBucket` is a 404 too, and treating it as absence turned a
+/// bucket-name typo into "none of your transcripts exist" — every read a 404
+/// and every listing empty, instead of the 5xx a misconfiguration deserves.
+/// `HeadObject` has no response body and so no code, which is why the test is
+/// for the bucket error rather than for the key error.
+fn is_missing<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkError<E>) -> bool {
+    matches!(error, SdkError::ServiceError(inner)
+        if inner.raw().status().as_u16() == 404 && error.code() != Some("NoSuchBucket"))
 }

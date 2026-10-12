@@ -71,6 +71,10 @@ pub enum Plan {
     WriteObject {
         key: Key,
         precondition: Precondition,
+        /// Recorded on the object, for the policies that read it back when
+        /// deciding. From the policy, never from the document: a publisher
+        /// must not pick the team its transcript counts as belonging to.
+        team: Option<String>,
     },
     DeleteObject(Key),
     List(ListPlan),
@@ -120,7 +124,11 @@ pub fn decide(
             match policy.authorize(who, action, &target) {
                 Decision::Deny(reason) => Plan::Reject(Status::FORBIDDEN, reason),
                 Decision::Allow => match precondition(if_match.as_deref(), facts) {
-                    Ok(precondition) => Plan::WriteObject { key, precondition },
+                    Ok(precondition) => Plan::WriteObject {
+                        key,
+                        precondition,
+                        team: policy.team_of(who),
+                    },
                     Err(reason) => Plan::Reject(Status::PRECONDITION_FAILED, reason),
                 },
             }

@@ -82,12 +82,22 @@ fn no_policy_permits_writing_over_another_principals_transcript() {
             Some(&existing(Some("red"))),
             policy.as_ref(),
         );
-        if let Plan::WriteObject { key, .. } = &plan {
-            assert_eq!(
+        match &plan {
+            Plan::WriteObject { key, .. } => assert_eq!(
                 key.owner().as_str(),
                 "alice",
                 "{name}: a publish must land under the caller's own prefix, got {key}"
-            );
+            ),
+            // A read-only deployment is the one policy allowed to refuse.
+            // Everything else must actually plan the write, or this test
+            // asserts nothing: with no arm here, a regression that turned
+            // every publish into a rejection left it green, and the
+            // `ReadOnlyMirror` row contributed no assertion at all.
+            Plan::Reject(..) => assert_eq!(
+                name, "ReadOnlyMirror",
+                "{name}: a self-publish must be planned, not refused: {plan:?}"
+            ),
+            other => panic!("{name}: a publish must plan a write, got {other:?}"),
         }
     }
 }

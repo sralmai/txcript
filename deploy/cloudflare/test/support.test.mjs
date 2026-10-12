@@ -79,6 +79,50 @@ test("a token for another audience is refused", async () => {
   assert.equal(await verifyAccessJwt(token, env), null);
 });
 
+test("a deployment with no AUD configured refuses every token", async () => {
+  // `[undefined].includes(undefined)` is true, so an unset ACCESS_AUD turned
+  // the audience check — the lock behind the Access gate — into a no-op for
+  // any token that carried no `aud` of its own.
+  resetJwksCacheForTests();
+  const { sign, jwks } = await issuer();
+  serveJwks(jwks);
+  const unconfigured = { ACCESS_CERTS_URL: env.ACCESS_CERTS_URL };
+  const audless = await sign({ email: "a@x.com", exp: future() });
+  assert.equal(await verifyAccessJwt(audless, unconfigured), null);
+  const scoped = await sign({ email: "a@x.com", aud: [AUD], exp: future() });
+  assert.equal(await verifyAccessJwt(scoped, unconfigured), null);
+});
+
+test("a forward-dated token is refused until it is valid", async () => {
+  resetJwksCacheForTests();
+  const { sign, jwks } = await issuer();
+  serveJwks(jwks);
+  const soon = Math.floor(Date.now() / 1000) + 300;
+  const token = await sign({ email: "a@x.com", aud: [AUD], exp: future(), nbf: soon, iat: soon });
+  assert.equal(await verifyAccessJwt(token, env), null);
+});
+
+test("a flood of unknown kids costs one certs fetch, not one each", async () => {
+  // The forced refetch runs before any signature is checked, so an
+  // unauthenticated caller controls it. Rate-limited, it cannot be an
+  // amplifier pointed at Cloudflare.
+  resetJwksCacheForTests();
+  const { sign, jwks } = await issuer();
+  const calls = serveJwks(jwks);
+  const token = await sign({ email: "a@x.com", aud: [AUD], exp: future() });
+  // Prime the cache, then present tokens whose kid is not in it.
+  await verifyAccessJwt(token, env);
+  const primed = calls.count;
+  for (let n = 0; n < 10; n += 1) {
+    const header = Buffer.from(JSON.stringify({ alg: "RS256", kid: `forged-${n}` })).toString(
+      "base64url",
+    );
+    const payload = Buffer.from(JSON.stringify({})).toString("base64url");
+    assert.equal(await verifyAccessJwt(`${header}.${payload}.AAAA`, env), null);
+  }
+  assert.equal(calls.count - primed, 1, "at most one forced refetch for the whole flood");
+});
+
 test("an expired token is refused", async () => {
   resetJwksCacheForTests();
   const { sign, jwks } = await issuer();

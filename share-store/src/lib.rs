@@ -134,6 +134,26 @@ impl Attrs {
     }
 }
 
+/// A version derived from an object's content.
+///
+/// The contract every backend meets is S3's: the version follows the *body*.
+/// An identical rewrite keeps it, and so does a metadata-only rewrite, because
+/// an S3 `ETag` is the body's digest and cannot be made to say otherwise. A
+/// backend whose version moved on every write — as the in-memory double's
+/// counter did — promises callers something the backend the service ships on
+/// does not, which is the overfitting this suite exists to catch.
+///
+/// FNV-1a, not a cryptographic digest, which this does not need.
+#[must_use]
+pub(crate) fn content_version(body: &[u8]) -> Version {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in body {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Version::new(format!("\"{hash:016x}\""))
+}
+
 /// The attributes a listing shows for a Simple transcript document.
 ///
 /// Shared so that a service and a direct-to-store client write the *same*

@@ -71,7 +71,7 @@ pub(crate) struct Request {
     pub headers: Vec<(&'static str, String)>,
     /// Credential-bearing headers, marked sensitive so they stay out of the
     /// HPACK dynamic table.
-    pub sensitive: Vec<(&'static str, String)>,
+    pub sensitive: Vec<(std::borrow::Cow<'static, str>, String)>,
     /// Hard cap on the response body; enforced against `Content-Length`
     /// first and then again while streaming, since the header may lie.
     pub max_bytes: u64,
@@ -218,7 +218,7 @@ async fn execute(
         let mut header = wreq::header::HeaderValue::from_str(value)
             .map_err(|_| format!("could not construct safe `{name}` header"))?;
         header.set_sensitive(true);
-        builder = builder.header(*name, header);
+        builder = builder.header(name.as_ref(), header);
     }
 
     let response = builder

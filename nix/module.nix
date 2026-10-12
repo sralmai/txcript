@@ -83,6 +83,26 @@ in
       default = { };
     };
 
+    environmentFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = lib.literalExpression ''config.age.secrets.s3-env.path'';
+      description = ''
+        A systemd `EnvironmentFile`, for the S3 backend's credentials.
+
+        The service takes secrets as *paths* wherever it can, but the AWS
+        client reads its own credentials from the ambient chain and cannot be
+        pointed at a file by this configuration. Under `DynamicUser` with
+        `ProtectHome` there is no `~/.aws` either, so without this an R2 or
+        MinIO deployment — which needs static keys — is not expressible, and
+        the service starts, binds, and fails every request.
+
+        Holds `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION`.
+        Not needed where the ambient chain already works: an instance role, or
+        a Kubernetes service account.
+      '';
+    };
+
     credentialFiles = lib.mkOption {
       type = lib.types.attrsOf lib.types.path;
       default = { };
@@ -108,6 +128,7 @@ in
         DynamicUser = true;
         StateDirectory = "txcript-share";
         LoadCredential = lib.mapAttrsToList (name: path: "${name}:${path}") cfg.credentialFiles;
+        EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
 
         # The service reads one config file, writes one state directory, and
         # talks to the network. Everything else is denied.

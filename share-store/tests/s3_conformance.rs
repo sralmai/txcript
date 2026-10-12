@@ -101,18 +101,89 @@ async fn a_conditional_create_is_atomic() {
     let store = S3::new(client, name).with_root(format!("race-{}", run_id()));
     let key = conformance::key("alice", "contested");
 
-    let first = store
-        .put(&key, b"first", &Attrs::new(), &Precondition::IfAbsent)
-        .await;
-    let second = store
-        .put(&key, b"second", &Attrs::new(), &Precondition::IfAbsent)
-        .await;
-
-    assert!(first.is_ok(), "the first create must win");
-    assert!(
-        matches!(second, Err(StoreError::PreconditionFailed)),
-        "the second must lose, got {second:?}"
+    // Issued together, not one after the other. Awaited sequentially, this
+    // asserted nothing the plain `IfAbsent` case does not already cover, and
+    // would have passed against a check-then-write implementation — which is
+    // the one thing it exists to rule out.
+    let attrs = Attrs::new();
+    let if_absent = Precondition::IfAbsent;
+    let (first, second) = tokio::join!(
+        store.put(&key, b"first", &attrs, &if_absent),
+        store.put(&key, b"second", &attrs, &if_absent),
     );
+
+    let winners = [&first, &second].iter().filter(|r| r.is_ok()).count();
+    assert_eq!(
+        winners, 1,
+        "exactly one create may win: {first:?} {second:?}"
+    );
+    assert!(
+        [&first, &second]
+            .iter()
+            .any(|r| matches!(r, Err(StoreError::PreconditionFailed))),
+        "the loser must be a precondition failure: {first:?} {second:?}"
+    );
+
+    // And the bytes stored are the winner's.
     let body = store.get(&key).await.expect("get").expect("present").body;
-    assert_eq!(body, b"first", "the loser must not have overwritten");
+    let expected: &[u8] = if first.is_ok() { b"first" } else { b"second" };
+    assert_eq!(body, expected, "the loser must not have overwritten");
+}
+
+/// A bucket key that is not a transcript must not end the listing.
+///
+/// `list` used to infer "more pages" from how many entries survived, so one
+/// skipped key made it report a partial catalog as complete.
+#[tokio::test]
+async fn a_foreign_key_does_not_truncate_a_listing() {
+    use txcript_share_store::{Attrs, ObjectStore};
+
+    let Some(client) = client() else {
+        eprintln!("skipping: TXCRIPT_S3_ENDPOINT is not set");
+        return;
+    };
+    let name = "txcript-share-conformance";
+    bucket(&client, name).await;
+    let root = format!("foreign-{}", run_id());
+    let store = S3::new(client.clone(), name).with_root(root.clone());
+
+    for n in 0..6 {
+        store
+            .put(
+                &conformance::key("alice", &format!("sess-{n}")),
+                b"{}",
+                &Attrs::new(),
+                &txcript_share_core::plan::Precondition::None,
+            )
+            .await
+            .expect("put");
+    }
+    // Something under the same root that is not a two-segment slug, sorting
+    // into the middle of the page.
+    client
+        .put_object()
+        .bucket(name)
+        .key(format!("{root}/alice/sess-2/nested/extra"))
+        .body(Vec::new().into())
+        .send()
+        .await
+        .expect("foreign key");
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = store.list("", cursor.as_ref(), 2).await.expect("list");
+        seen.extend(page.objects.iter().map(|meta| meta.key.to_slug()));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        6,
+        "every transcript must be listed, got {seen:?}"
+    );
 }

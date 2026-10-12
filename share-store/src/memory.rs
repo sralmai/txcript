@@ -16,7 +16,6 @@ pub struct InMemory {
     /// When set, every operation fails with this error. Fault injection, for
     /// asserting that a host maps a backend outage to 503 rather than 404.
     fault: Option<String>,
-    counter: Arc<Mutex<u64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,17 +46,6 @@ impl InMemory {
             Some(detail) => Err(StoreError::Backend(detail.clone())),
             None => Ok(()),
         }
-    }
-
-    /// Monotonic versions, so a stale `IfVersion` is always distinguishable
-    /// from a current one even when the bytes are identical.
-    fn next_version(&self) -> Result<Version, StoreError> {
-        let mut counter = self
-            .counter
-            .lock()
-            .map_err(|_| StoreError::Backend("lock poisoned".into()))?;
-        *counter += 1;
-        Ok(Version::new(format!("\"v{counter}\"")))
     }
 
     fn meta_of(stored: &Stored) -> ObjectMeta {
@@ -91,7 +79,7 @@ impl ObjectStore for InMemory {
         precondition: &Precondition,
     ) -> Result<Version, StoreError> {
         self.check()?;
-        let version = self.next_version()?;
+        let version = crate::content_version(body);
         let mut objects = self
             .objects
             .lock()

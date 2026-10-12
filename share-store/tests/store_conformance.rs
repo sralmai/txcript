@@ -167,3 +167,89 @@ async fn an_indexed_catalog_can_disagree_with_the_store() {
         "the store does not have it — a host must handle this"
     );
 }
+
+/// Two writers racing one key must not corrupt it.
+///
+/// The staging path used to be derived from the key, so both writers shared a
+/// temp inode: one renamed it into place, the other's bytes landed in the file
+/// that was already live, and the winner was told its own body had been
+/// stored. The object then held one writer's bytes under the other's version.
+///
+/// Real OS threads and a barrier, not `tokio::join!` on a current-thread
+/// runtime: `put` does blocking file I/O and never yields, so joined futures
+/// would run strictly one after the other and race nothing.
+#[test]
+fn concurrent_writers_cannot_leave_a_version_that_is_not_the_content() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Filesystem::new(dir.path());
+    let k = conformance::key("alice", "contested");
+    let bodies = [vec![b'a'; 8 * 1024 * 1024], vec![b'b'; 8 * 1024 * 1024]];
+
+    for _ in 0..40 {
+        let reported = race(&store, &k, &bodies, &Precondition::None);
+        let stored = block_on(store.get(&k)).expect("get").expect("present");
+        let Some(whose) = bodies.iter().position(|body| *body == stored.body) else {
+            panic!("the object holds a mixture of both writers' bytes");
+        };
+        // The writer whose bytes are stored is the one whose version must be
+        // recorded. Accepting "some writer's version" would miss the real
+        // failure: one writer's bytes under the *other* writer's version, with
+        // that other writer told it had succeeded.
+        assert_eq!(
+            reported[whose].as_ref().ok(),
+            Some(&stored.meta.version),
+            "the stored bytes belong to writer {whose}, whose result was {:?}, \
+             but the recorded version is {:?}",
+            reported[whose],
+            stored.meta.version
+        );
+    }
+}
+
+/// Only one of two racing creates may be told it succeeded.
+#[test]
+fn only_one_racing_create_can_win() {
+    for _ in 0..40 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Filesystem::new(dir.path());
+        let k = conformance::key("alice", "created-once");
+        let bodies = [b"one".to_vec(), b"two".to_vec()];
+
+        let reported = race(&store, &k, &bodies, &Precondition::IfAbsent);
+        let winners = reported.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(winners, 1, "exactly one create may succeed: {reported:?}");
+        assert!(
+            reported
+                .iter()
+                .any(|r| matches!(r, Err(StoreError::PreconditionFailed))),
+            "the loser must be a precondition failure, not a backend error: {reported:?}"
+        );
+    }
+}
+
+/// Both bodies written to one key at once, from two threads released
+/// together. Returns what each writer was told.
+fn race(
+    store: &Filesystem,
+    k: &txcript_share_core::Key,
+    bodies: &[Vec<u8>; 2],
+    precondition: &Precondition,
+) -> [Result<txcript_share_store::Version, StoreError>; 2] {
+    let gate = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let handles = bodies.each_ref().map(|body| {
+            scope.spawn(|| {
+                gate.wait();
+                block_on(store.put(k, body, &Attrs::new(), precondition))
+            })
+        });
+        handles.map(|handle| handle.join().expect("writer thread"))
+    })
+}
+
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime")
+        .block_on(future)
+}

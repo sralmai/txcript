@@ -29,4 +29,8 @@ mod store_delete;
 
 #[cfg(feature = "search")]
 mod search;
+// The module's imports need the `share` harness, which is not a default
+// feature; ungated, a plain `cargo test` fails to compile this binary and no
+// integration test runs at all.
+#[cfg(feature = "share")]
 mod share_round_trip;
