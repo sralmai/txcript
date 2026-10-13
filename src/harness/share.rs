@@ -463,8 +463,14 @@ impl Store for ShareStore {
 
 // --- the rules a bucket publisher needs -------------------------------
 
-/// The bucket policy a direct-to-bucket publisher needs: read every
-/// transcript, list the bucket, write only its own prefix.
+/// The IAM policy a direct-to-bucket publisher needs: read every transcript,
+/// list the bucket, write only its own prefix.
+///
+/// An *identity* policy — it carries no `Principal` and is attached to the
+/// user, role or token that publishes. It is deliberately not a bucket policy:
+/// `put-bucket-policy` would reject it for the missing `Principal`, and the
+/// permissions belong to the publisher rather than to the bucket, since each
+/// publisher gets a different prefix.
 ///
 /// Deliberately *not* behind `share_s3`. The rules have to be in place before
 /// the identity they describe can publish anything, so a stock build has to be
@@ -584,7 +590,7 @@ fn checked_bucket(bucket: &str) -> Result<()> {
 pub enum ConfiguredStore {
     /// Through a share service.
     Served(ShareStore),
-    /// Straight to an object store, with the bucket policy as the boundary.
+    /// Straight to an object store, with the bucket access rules as the boundary.
     #[cfg(feature = "share_s3")]
     Direct(crate::harness::share_s3::DirectStore),
 }

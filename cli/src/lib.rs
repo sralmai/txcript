@@ -108,7 +108,7 @@ pub enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-    /// Print the bucket policy a direct-to-bucket publisher needs
+    /// Print the IAM policy a direct-to-bucket publisher needs
     ///
     /// Publishing straight to S3 has no service in the path, so the bucket's
     /// own policy is the entire access boundary: read everyone's transcripts,
@@ -1463,9 +1463,14 @@ fn cmd_s3_policy(
         || format!("{bucket}/{owner}/"),
         |prefix| format!("{bucket}/{}/{owner}/", prefix.trim_end_matches('/')),
     );
-    eprintln!("Bucket policy for `{owner}`, who may write only {scope}");
+    eprintln!("IAM policy for `{owner}`, who may write only {scope}");
     eprintln!();
-    eprintln!("Attach it to that identity, then publish with:");
+    eprintln!("This is an identity policy: attach it to the user, role or token");
+    eprintln!("that publishes — `aws iam put-user-policy`, or an R2 token's");
+    eprintln!("permissions. It is not a bucket policy, and `put-bucket-policy`");
+    eprintln!("will reject it for the missing `Principal`.");
+    eprintln!();
+    eprintln!("Then publish with:");
     eprintln!("    export TXCRIPT_SHARE_BUCKET={bucket}");
     eprintln!("    export TXCRIPT_SHARE_OWNER={owner}");
     if let Some(prefix) = prefix {

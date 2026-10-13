@@ -331,8 +331,12 @@ gives you a file to paste or apply. Add `--prefix <name>` when one bucket
 hosts several deployments; the listing permission is then scoped to it, so one
 deployment cannot enumerate the others.
 
-Attach the result to that publisher's identity — an IAM user or role on AWS,
-an API token scoped to the bucket on R2.
+What it prints is an **identity** policy: it carries no `Principal` and is
+attached to the user, role or token that publishes — `aws iam put-user-policy`
+on AWS, an API token's permissions on R2. It is not a bucket policy, and
+`put-bucket-policy` rejects it for the missing `Principal`. Permissions belong
+to the publisher here rather than to the bucket, because each publisher gets a
+different prefix.
 
 #### 3. Configure the client
 

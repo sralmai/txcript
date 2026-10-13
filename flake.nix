@@ -100,7 +100,7 @@
 
           # The CLI with the direct-to-bucket backend compiled in, for
           # publishing to S3 with no service in the path. `txcript s3-policy`
-          # prints the bucket policy that path requires.
+          # prints the IAM policy that path requires.
           txcript-s3 = pkgs.callPackage ./nix/cli.nix {
             inherit rustPlatform;
             features = [ "share_s3" ];

@@ -176,8 +176,8 @@ header.
 
 There is a third option if everyone already has credentials for one bucket:
 publish straight to S3, with no service to run at all. Ownership is then
-enforced by the bucket's own policy, and `txcript s3-policy` prints the one it
-needs:
+enforced by the bucket's access rules, and `txcript s3-policy` prints the IAM
+policy each publisher needs:
 
 ```sh
 nix profile install github:skillsynchq/txcript#txcript-s3
