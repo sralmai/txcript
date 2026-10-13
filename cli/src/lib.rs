@@ -1486,7 +1486,11 @@ fn cmd_s3_policy(
         eprintln!("built without `share_s3`. The rules above are still what the");
         eprintln!("bucket needs; see docs/deploy.md for a build that can use them.");
     }
-    println!("{policy}");
+    // Not `println!`: a closed reader (`… | head`) makes that panic, and the
+    // whole point of putting the policy on stdout is that it gets piped.
+    // `completion` guards the same way.
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), policy.as_bytes());
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
     Ok(ExitCode::SUCCESS)
 }
 
