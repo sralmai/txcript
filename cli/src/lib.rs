@@ -108,6 +108,31 @@ pub enum Command {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// Print the IAM policy a direct-to-bucket publisher needs
+    ///
+    /// Publishing straight to S3 has no service in the path, so the bucket's
+    /// own policy is the entire access boundary: read everyone's transcripts,
+    /// write only your own prefix. Without the prefix condition any publisher
+    /// can overwrite any other, and neither the client nor anything else
+    /// stops it.
+    ///
+    /// The policy goes to stdout and the guidance to stderr, so
+    /// `txcript s3-policy > policy.json` gives you a file to paste or apply.
+    ///
+    /// Each value falls back to the variable the direct store itself reads,
+    /// so a machine already configured for publishing needs no flags.
+    #[cfg(feature = "share")]
+    S3Policy {
+        /// Bucket the policy is for
+        #[arg(long, value_name = "NAME", env = "TXCRIPT_SHARE_BUCKET")]
+        bucket: Option<String>,
+        /// The one prefix this identity may write
+        #[arg(long, value_name = "PREFIX", env = "TXCRIPT_SHARE_OWNER")]
+        owner: Option<String>,
+        /// Key prefix inside the bucket, when it hosts several deployments
+        #[arg(long, value_name = "PREFIX", env = "TXCRIPT_SHARE_PREFIX")]
+        prefix: Option<String>,
+    },
 }
 
 /// The session commands — `list`, `continue`, `view`, `export`, `query` — as one clap
@@ -391,6 +416,12 @@ pub fn run(cli: Cli) -> ExitCode {
             .build()
             .map_err(|e| format!("starting the async runtime: {e}"))
             .and_then(|runtime| runtime.block_on(mcp::serve(options.cache))),
+        #[cfg(feature = "share")]
+        Command::S3Policy {
+            bucket,
+            owner,
+            prefix,
+        } => cmd_s3_policy(bucket, owner, prefix.as_deref()),
         Command::Completion { shell } => {
             // Render to a buffer first: a failed stdout write means the
             // reader is gone (`… | head`), which should end quietly, not
@@ -769,6 +800,39 @@ mod filter_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "share")]
+    fn s3_policy_takes_its_values_from_flags_or_the_environment() {
+        // Parseable with no flags at all: the values fall back to the same
+        // variables the direct store reads, so a machine already configured
+        // for publishing needs none. (Not asserting they are `None` — the
+        // environment running the tests may legitimately have them set.)
+        assert!(crate::Cli::try_parse_from(["txcript", "s3-policy"]).is_ok());
+
+        let given = crate::Cli::try_parse_from([
+            "txcript",
+            "s3-policy",
+            "--bucket",
+            "b",
+            "--owner",
+            "alice",
+            "--prefix",
+            "prod",
+        ])
+        .expect("parses");
+        let crate::Command::S3Policy {
+            bucket,
+            owner,
+            prefix,
+        } = given.command
+        else {
+            panic!("expected s3-policy");
+        };
+        assert_eq!(bucket.as_deref(), Some("b"));
+        assert_eq!(owner.as_deref(), Some("alice"));
+        assert_eq!(prefix.as_deref(), Some("prod"));
     }
 
     /// `pull` with no destination writes a document, never into a harness's
@@ -1368,6 +1432,65 @@ fn crop_loaded(
         fragment::format_spans(&outcome.spans),
         style::scrub(&cropped_id)
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `s3-policy` — print the rules a direct-to-bucket publisher needs.
+///
+/// stdout is the policy alone so it can be redirected to a file; stderr
+/// carries what it was built from and what to do with it, which is the part a
+/// person needs and a pipe does not.
+#[cfg(feature = "share")]
+fn cmd_s3_policy(
+    bucket: Option<String>,
+    owner: Option<String>,
+    prefix: Option<&str>,
+) -> Result<ExitCode, String> {
+    use txcript::harness::share::{direct_access_policy, key_root};
+
+    // clap has already applied the environment fallbacks.
+    let bucket = bucket.ok_or("no bucket: pass --bucket, or set TXCRIPT_SHARE_BUCKET")?;
+    let owner = owner.ok_or("no owner: pass --owner, or set TXCRIPT_SHARE_OWNER")?;
+
+    let policy = direct_access_policy(&bucket, &owner, prefix).map_err(|e| e.to_string())?;
+
+    // Through the same normalisation the store and the policy use, so the
+    // scope printed is the scope granted. An unset variable arrives as an
+    // empty string, which is no prefix rather than an empty level.
+    let root = key_root(prefix).map_err(|e| e.to_string())?;
+    let scope = format!("{bucket}/{root}{owner}/");
+    eprintln!("IAM policy for `{owner}`, who may write only {scope}");
+    eprintln!();
+    eprintln!("This is an identity policy: attach it to the user, role or token");
+    eprintln!("that publishes — `aws iam put-user-policy`, or an R2 token's");
+    eprintln!("permissions. It is not a bucket policy, and `put-bucket-policy`");
+    eprintln!("will reject it for the missing `Principal`.");
+    eprintln!();
+    eprintln!("Then publish with:");
+    eprintln!("    export TXCRIPT_SHARE_BUCKET={bucket}");
+    eprintln!("    export TXCRIPT_SHARE_OWNER={owner}");
+    if !root.is_empty() {
+        eprintln!(
+            "    export TXCRIPT_SHARE_PREFIX={}",
+            root.trim_end_matches('/')
+        );
+    }
+    eprintln!("    txcript push <session-id>");
+    eprintln!();
+    eprintln!("Give every publisher their own owner prefix. The condition on");
+    eprintln!("writes is the only thing enforcing ownership on this path: with a");
+    eprintln!("wider policy, any publisher can overwrite any other's transcripts.");
+    if !cfg!(feature = "share_s3") {
+        eprintln!();
+        eprintln!("Note: this binary cannot publish directly to a bucket — it was");
+        eprintln!("built without `share_s3`. The rules above are still what the");
+        eprintln!("bucket needs; see docs/deploy.md for a build that can use them.");
+    }
+    // Not `println!`: a closed reader (`… | head`) makes that panic, and the
+    // whole point of putting the policy on stdout is that it gets piped.
+    // `completion` guards the same way.
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), policy.as_bytes());
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2152,7 +2275,15 @@ fn resume_workdir(cwd: Option<&str>) -> Option<PathBuf> {
 
 fn discover_with_spinner(from: Option<HarnessId>) -> Result<Vec<local::Session>, String> {
     let spinner = spin::Spinner::start("searching local sessions…");
-    let sessions = if matches!(from, Some(HarnessId::ClaudeChat | HarnessId::ChatGpt)) {
+    // A named remote harness is resolved on its own, so a store that cannot
+    // be reached fails the command. Through the aggregate scan it would only
+    // warn, and `--from share` against a misconfigured bucket would report
+    // "no sessions found" and exit 0 — which is what success looks like.
+    let named_remote = matches!(
+        from,
+        Some(HarnessId::ClaudeChat | HarnessId::ChatGpt | HarnessId::Share)
+    );
+    let sessions = if named_remote {
         let harness = from.unwrap_or(HarnessId::ClaudeChat);
         spinner.set(format!("reading {harness}…"));
         local::discover_harness(harness).map_err(|error| error.to_string())?

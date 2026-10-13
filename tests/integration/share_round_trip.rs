@@ -272,7 +272,11 @@ mod interchangeable {
                 "txcript-test",
             ))
             .build();
-        Some(S3::new(aws_sdk_s3::Client::from_conf(config), bucket).with_root(root))
+        Some(
+            S3::new(aws_sdk_s3::Client::from_conf(config), bucket)
+                .with_root(root)
+                .expect("prefix"),
+        )
     }
 
     /// Creating an existing bucket is not an error worth failing on.

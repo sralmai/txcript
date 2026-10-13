@@ -111,6 +111,8 @@ Storage backends and identity providers are compile-time features, so a
 deployment does not ship or audit code it never calls.
 
 ```sh
+nix build .#txcript                   # the CLI (also the flake's default)
+nix build .#txcript-s3                # the CLI, publishing straight to a bucket
 nix build .#share-server              # filesystem storage, header identity
 nix build .#share-server-s3           # + the S3 backend
 nix build .#share-server-access       # + Cloudflare Access JWT verification
@@ -290,52 +292,77 @@ instead of a 401 — that is Access doing its job in front.
 
 ### Publishing straight to a bucket, with no service
 
-If everyone already has bucket credentials and "write your own prefix, read
-everything" is the whole rule, you can skip the service.
+If everyone already has credentials for one bucket and "write your own prefix,
+read everything" is the whole rule, you can skip the service entirely.
 
-Create a bucket with no public access — its own policy is now the entire
-access boundary. Then give **each publisher their own prefix**, because this
-is what makes ownership real: without the prefix condition any publisher can
-overwrite any other, and the client neither enforces that nor can.
+Create a bucket with no public access — its own policy is now the **entire**
+access boundary.
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Sid": "ReadEveryTranscript", "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": "arn:aws:s3:::my-txcript-bucket/*" },
-    { "Sid": "ListTheBucket", "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
-      "Resource": "arn:aws:s3:::my-txcript-bucket" },
-    { "Sid": "WriteOnlyMyOwnPrefix", "Effect": "Allow",
-      "Action": ["s3:PutObject", "s3:DeleteObject"],
-      "Resource": "arn:aws:s3:::my-txcript-bucket/alice/*" }
-  ]
-}
-```
+#### 1. Install a build that can talk to a bucket
 
-This path is **not in the release binaries and not on crates.io** — it
-depends on two workspace crates that are deliberately unpublished, so it is
-built from a clone:
+The direct backend is off in the release binaries, because it pulls the AWS
+client in with it. With Nix:
 
 ```sh
-git clone https://github.com/skillsynchq/txcript && cd txcript
-cargo install --path cli --features share_s3
-
-export TXCRIPT_SHARE_BUCKET=my-txcript-bucket
-export TXCRIPT_SHARE_OWNER=alice          # must match the prefix IAM allows
-export TXCRIPT_SHARE_ENDPOINT=…           # optional: R2, MinIO, Ceph
+nix profile install github:skillsynchq/txcript#txcript-s3
 ```
 
-`alice` must match the prefix in the policy, or writes fail on the first
-publish rather than at configuration time.
+From a clone, if you would rather not use Nix:
 
-What you give up: every reader needs bucket credentials, nothing validates
-that what lands is a transcript, policies a prefix cannot express (team
-scoping) are unavailable, and listing costs one `HEAD` per entry. Both paths
-write an identical bucket layout, so a service placed in front of a bucket
-written directly lists it correctly, and vice versa.
+```sh
+cargo install --path cli --features share_s3
+```
+
+#### 2. Print the policy, and attach it
+
+Give **every publisher their own prefix**. This is what makes ownership real:
+without the condition on writes, any publisher can overwrite any other's
+transcripts, and neither the client nor anything else stops it.
+
+Rather than copying a policy out of this page, ask the tool for it — so what
+you attach and what the tool expects cannot drift apart:
+
+```sh
+txcript s3-policy --bucket my-txcript-bucket --owner alice > alice-policy.json
+```
+
+The policy goes to stdout and the guidance to stderr, so the redirect above
+gives you a file to paste or apply. Add `--prefix <name>` when one bucket
+hosts several deployments; the listing permission is then scoped to it, so one
+deployment cannot enumerate the others.
+
+What it prints is an **identity** policy: it carries no `Principal` and is
+attached to the user, role or token that publishes — `aws iam put-user-policy`
+on AWS, an API token's permissions on R2. It is not a bucket policy, and
+`put-bucket-policy` rejects it for the missing `Principal`. Permissions belong
+to the publisher here rather than to the bucket, because each publisher gets a
+different prefix.
+
+#### 3. Configure the client
+
+```sh
+export TXCRIPT_SHARE_BUCKET=my-txcript-bucket
+export TXCRIPT_SHARE_OWNER=alice          # must match the prefix the policy allows
+export TXCRIPT_SHARE_ENDPOINT=…           # optional: R2, MinIO, Ceph
+export TXCRIPT_SHARE_PREFIX=…             # optional, and must match --prefix above
+                                          # one or more plain segments, e.g. `prod`
+                                          # or `team-a/prod`; `prod//` is refused
+```
+
+`TXCRIPT_SHARE_OWNER` must match the prefix in the policy, or writes fail on
+the first publish rather than at configuration time. A build without the
+backend tells you so by name rather than reporting an empty store.
+
+Then `txcript push`, `txcript pull` and `txcript list --from share` work as
+they do against a service.
+
+#### What you give up
+
+Every reader needs bucket credentials, nothing validates that what lands is a
+transcript, policies a prefix cannot express (team scoping) are unavailable,
+and listing costs one `HEAD` per entry. Both paths write an identical bucket
+layout, so a service placed in front of a bucket written directly lists it
+correctly, and vice versa.
 
 Setting both `TXCRIPT_SHARE_URL` and `TXCRIPT_SHARE_BUCKET` is an error
 rather than a silent preference.

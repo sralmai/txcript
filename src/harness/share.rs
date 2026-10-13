@@ -461,6 +461,159 @@ impl Store for ShareStore {
     }
 }
 
+// --- the rules a bucket publisher needs -------------------------------
+
+/// The IAM policy a direct-to-bucket publisher needs: read every transcript,
+/// list the bucket, write only its own prefix.
+///
+/// An *identity* policy — it carries no `Principal` and is attached to the
+/// user, role or token that publishes. It is deliberately not a bucket policy:
+/// `put-bucket-policy` would reject it for the missing `Principal`, and the
+/// permissions belong to the publisher rather than to the bucket, since each
+/// publisher gets a different prefix.
+///
+/// Deliberately *not* behind `share_s3`. The rules have to be in place before
+/// the identity they describe can publish anything, so a stock build has to be
+/// able to print them — and someone deciding whether to use the direct path at
+/// all should be able to read what it will ask of their bucket first.
+///
+/// Generated rather than copied out of the documentation, so the two cannot
+/// drift, and built through `serde_json` rather than formatted by hand, so a
+/// bucket or owner name containing a quote cannot produce a policy that is
+/// valid JSON saying something other than it appears to.
+///
+/// `prefix` is the optional key prefix inside the bucket, for a bucket hosting
+/// more than one deployment.
+///
+/// # Errors
+/// When any value would not name what it appears to name. The condition on
+/// writes is the only thing enforcing ownership on this path, so a value that
+/// widens it has to be refused rather than rendered.
+pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> Result<String> {
+    checked_bucket(bucket)?;
+    crate::harness::checked_id_component(Share::NAME, owner)?;
+    checked_arn_literal("owner", owner)?;
+    if let Some(prefix) = prefix {
+        checked_arn_literal("prefix", prefix)?;
+    }
+
+    let root = key_root(prefix)?;
+    let bucket_arn = format!("arn:aws:s3:::{bucket}");
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ReadEveryTranscript",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": format!("{bucket_arn}/{root}*"),
+            },
+            {
+                "Sid": "ListTheBucket",
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": bucket_arn,
+                // Scoped, so one bucket can host several deployments without
+                // each one being able to enumerate the others.
+                "Condition": { "StringLike": { "s3:prefix": [format!("{root}*")] } },
+            },
+            {
+                "Sid": "WriteOnlyMyOwnPrefix",
+                "Effect": "Allow",
+                "Action": ["s3:PutObject", "s3:DeleteObject"],
+                "Resource": format!("{bucket_arn}/{root}{owner}/*"),
+            },
+        ],
+    });
+    serde_json::to_string_pretty(&policy)
+        .map_err(|error| remote(&format!("could not render the policy: {error}")))
+}
+
+/// The key prefix the store will actually use, given a configured prefix.
+///
+/// **Must match `S3::with_root`**, which canonicalises to exactly one trailing
+/// slash and refuses an empty path segment. The rule is stated twice because
+/// this has to work in a build without the S3 backend — someone needs the
+/// rules before they have a binary that can use them — so a test pins the two
+/// against each other.
+///
+/// # Errors
+/// When the prefix has an empty, `.` or `..` segment, or a control character.
+/// Those are refused rather than rewritten: a second normalisation is one more
+/// thing for two components to disagree about, which is the bug this replaced.
+pub fn key_root(prefix: Option<&str>) -> Result<String> {
+    let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) else {
+        return Ok(String::new());
+    };
+    let body = prefix.strip_suffix('/').unwrap_or(prefix);
+    let refuse = |why: &str| {
+        Err(remote(&format!(
+            "`{}` is not usable as a prefix: {why}",
+            prefix.escape_debug()
+        )))
+    };
+    if body.is_empty() {
+        return refuse("it names the bucket root, which is an empty prefix");
+    }
+    for segment in body.split('/') {
+        if segment.is_empty() {
+            return refuse("it has an empty path segment");
+        }
+        if segment == "." || segment == ".." {
+            return refuse("`.` and `..` are not path segments here");
+        }
+        if segment.chars().any(char::is_control) {
+            return refuse("it contains a control character");
+        }
+    }
+    Ok(format!("{body}/"))
+}
+
+/// Reject a value that IAM would read as a pattern rather than a literal.
+///
+/// Every one of these is interpolated into a resource ARN. IAM treats `*` and
+/// `?` as wildcards and `${…}` as a variable, so `--owner '*'` would render
+/// `arn:aws:s3:::bucket/*/*` — Put and Delete over every publisher's
+/// transcripts — while the surrounding text still claimed one prefix. The
+/// policy is the only thing enforcing ownership here, so a value that cannot
+/// be rendered honestly is refused instead.
+fn checked_arn_literal(what: &str, value: &str) -> Result<()> {
+    if let Some(found) = value
+        .chars()
+        .find(|c| matches!(c, '*' | '?' | '$' | '{' | '}'))
+    {
+        return Err(remote(&format!(
+            "the {what} contains `{found}`, which IAM reads as a pattern rather than \
+             a literal; it would grant more than it appears to"
+        )));
+    }
+    Ok(())
+}
+
+/// A bucket name, by S3's rules, which exclude every ARN metacharacter.
+///
+/// Checked rather than trusted because the bucket is interpolated into the
+/// read and list resources: `--bucket '*'` would widen both to every bucket
+/// the identity can see.
+fn checked_bucket(bucket: &str) -> Result<()> {
+    let shaped = (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && bucket.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && bucket.ends_with(|c: char| c.is_ascii_alphanumeric());
+    if shaped {
+        Ok(())
+    } else {
+        Err(remote(&format!(
+            "`{}` is not a bucket name: 3-63 characters of lowercase letters, \
+             digits, `-` and `.`, starting and ending alphanumeric",
+            bucket.escape_debug()
+        )))
+    }
+}
+
 // --- the configured store ---------------------------------------------
 
 /// Whichever share backing this machine is configured for.
@@ -471,7 +624,7 @@ impl Store for ShareStore {
 pub enum ConfiguredStore {
     /// Through a share service.
     Served(ShareStore),
-    /// Straight to an object store, with the bucket policy as the boundary.
+    /// Straight to an object store, with the bucket access rules as the boundary.
     #[cfg(feature = "share_s3")]
     Direct(crate::harness::share_s3::DirectStore),
 }
@@ -490,22 +643,45 @@ pub enum ConfiguredStore {
 /// # Errors
 /// When both paths are configured, or the selected one is misconfigured.
 pub fn from_env() -> Result<Option<ConfiguredStore>> {
-    let served = std::env::var("TXCRIPT_SHARE_URL").is_ok_and(|value| !value.trim().is_empty());
-    #[cfg(feature = "share_s3")]
-    let direct = std::env::var("TXCRIPT_SHARE_BUCKET").is_ok_and(|value| !value.trim().is_empty());
-    #[cfg(not(feature = "share_s3"))]
-    let direct = false;
+    let configured = |name: &str| std::env::var(name).is_ok_and(|value| !value.trim().is_empty());
+    // Both variables are read regardless of the features this build has.
+    // Reading the bucket only under `share_s3` made the refusal below
+    // unreachable, so a build without the backend ignored a configured bucket
+    // and reported an empty store — the one answer that looks like success.
+    match selected(
+        configured("TXCRIPT_SHARE_URL"),
+        configured("TXCRIPT_SHARE_BUCKET"),
+    )? {
+        Selected::Nothing => Ok(None),
+        Selected::Served => Ok(Some(ConfiguredStore::Served(ShareStore::from_env()?))),
+        #[cfg(feature = "share_s3")]
+        Selected::Direct => Ok(Some(ConfiguredStore::Direct(
+            crate::harness::share_s3::DirectStore::from_env()?,
+        ))),
+    }
+}
 
+/// Which backing the environment names.
+#[derive(Debug, PartialEq, Eq)]
+enum Selected {
+    Nothing,
+    Served,
+    #[cfg(feature = "share_s3")]
+    Direct,
+}
+
+/// The selection rule, separated from the environment so it is testable
+/// without mutating process state — which this workspace forbids the `unsafe`
+/// for anyway.
+fn selected(served: bool, direct: bool) -> Result<Selected> {
     match (served, direct) {
-        (false, false) => Ok(None),
+        (false, false) => Ok(Selected::Nothing),
         (true, true) => Err(remote(
             "both TXCRIPT_SHARE_URL and TXCRIPT_SHARE_BUCKET are set; unset one to choose a path",
         )),
-        (true, false) => Ok(Some(ConfiguredStore::Served(ShareStore::from_env()?))),
+        (true, false) => Ok(Selected::Served),
         #[cfg(feature = "share_s3")]
-        (false, true) => Ok(Some(ConfiguredStore::Direct(
-            crate::harness::share_s3::DirectStore::from_env()?,
-        ))),
+        (false, true) => Ok(Selected::Direct),
         #[cfg(not(feature = "share_s3"))]
         (false, true) => Err(remote(
             "TXCRIPT_SHARE_BUCKET is set but direct S3 support was not compiled in \
@@ -571,6 +747,149 @@ mod tests {
         for bad in ["no-colon", ": value", "name:", ""] {
             assert!(parse_header(bad).is_none(), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn configuring_both_paths_is_an_error_rather_than_a_silent_preference() {
+        assert!(selected(true, true).is_err());
+        assert_eq!(selected(false, false).ok(), Some(Selected::Nothing));
+        assert_eq!(selected(true, false).ok(), Some(Selected::Served));
+    }
+
+    #[test]
+    #[cfg(not(feature = "share_s3"))]
+    fn a_configured_bucket_is_refused_by_name_when_the_backend_is_absent() {
+        // Silently reporting an empty store is the one answer that looks like
+        // success, so a build that cannot use the bucket has to say so.
+        let message = selected(false, true)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("share_s3"),
+            "the refusal must name the missing feature, got {message:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "share_s3")]
+    fn a_configured_bucket_selects_the_direct_path() {
+        assert_eq!(selected(false, true).ok(), Some(Selected::Direct));
+    }
+
+    #[test]
+    fn the_access_policy_grants_reads_broadly_and_writes_only_to_one_prefix() {
+        let policy = direct_access_policy("my-bucket", "alice", None).expect("policy");
+        let parsed: serde_json::Value = serde_json::from_str(&policy).expect("valid JSON");
+        let statements = parsed["Statement"].as_array().expect("statements");
+
+        let resource_of = |sid: &str| {
+            statements
+                .iter()
+                .find(|s| s["Sid"] == sid)
+                .map(|s| s["Resource"].as_str().unwrap_or_default().to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            resource_of("ReadEveryTranscript"),
+            "arn:aws:s3:::my-bucket/*"
+        );
+        assert_eq!(resource_of("ListTheBucket"), "arn:aws:s3:::my-bucket");
+        // The whole point: writes are confined to the publisher's own prefix,
+        // because on this path nothing else enforces ownership.
+        assert_eq!(
+            resource_of("WriteOnlyMyOwnPrefix"),
+            "arn:aws:s3:::my-bucket/alice/*"
+        );
+    }
+
+    #[test]
+    fn the_key_root_matches_what_the_store_will_use() {
+        // Pinned against `S3::with_root`, which these have to agree with: one
+        // trailing slash added only when absent, and nothing trimmed. A policy
+        // built from a different normalisation denies the pushes it exists to
+        // allow.
+        assert_eq!(key_root(None).ok(), Some(String::new()));
+        assert_eq!(key_root(Some("")).ok(), Some(String::new()));
+        assert_eq!(key_root(Some("prod")).ok(), Some("prod/".to_string()));
+        assert_eq!(key_root(Some("prod/")).ok(), Some("prod/".to_string()));
+        assert_eq!(key_root(Some("a/b")).ok(), Some("a/b/".to_string()));
+        // One spelling per prefix: an empty segment names something other
+        // than it appears to, and is refused rather than rewritten.
+        for bad in ["prod//", "/prod", "//", "/", "prod/../x", "prod/./x"] {
+            assert!(key_root(Some(bad)).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_empty_prefix_is_the_same_policy_as_no_prefix() {
+        let none = direct_access_policy("my-bucket", "alice", None).expect("policy");
+        let empty = direct_access_policy("my-bucket", "alice", Some("")).expect("policy");
+        assert_eq!(
+            none, empty,
+            "an unset variable reads as empty, not as a level"
+        );
+    }
+
+    #[test]
+    fn a_prefixed_deployment_cannot_read_or_enumerate_its_neighbours() {
+        let policy = direct_access_policy("shared", "alice", Some("prod/")).expect("policy");
+        let parsed: serde_json::Value = serde_json::from_str(&policy).expect("valid JSON");
+        let statements = parsed["Statement"].as_array().expect("statements");
+
+        let listing = statements
+            .iter()
+            .find(|s| s["Sid"] == "ListTheBucket")
+            .expect("listing statement");
+        assert_eq!(
+            listing["Condition"]["StringLike"]["s3:prefix"][0], "prod/*",
+            "a listing must be scoped, or one deployment enumerates the others"
+        );
+        let write = statements
+            .iter()
+            .find(|s| s["Sid"] == "WriteOnlyMyOwnPrefix")
+            .expect("write statement");
+        assert_eq!(write["Resource"], "arn:aws:s3:::shared/prod/alice/*");
+    }
+
+    #[test]
+    fn a_value_iam_would_read_as_a_pattern_is_refused() {
+        // Each of these is interpolated into a resource ARN. Rendered, they
+        // would grant far more than the surrounding text claims.
+        for owner in ["*", "a*", "?", "a?b", "${aws:username}", "a$b", "{x}"] {
+            assert!(
+                direct_access_policy("my-bucket", owner, None).is_err(),
+                "owner {owner:?} must not produce a policy"
+            );
+        }
+        for bucket in ["*", "my-*", "MyBucket", "ab", "-abc", "abc-", "a/b", "a b"] {
+            assert!(
+                direct_access_policy(bucket, "alice", None).is_err(),
+                "bucket {bucket:?} must not produce a policy"
+            );
+        }
+        for prefix in ["*", "prod/*", "${x}", "a?"] {
+            assert!(
+                direct_access_policy("my-bucket", "alice", Some(prefix)).is_err(),
+                "prefix {prefix:?} must not produce a policy"
+            );
+        }
+        // And the ordinary shapes still do.
+        assert!(direct_access_policy("my-bucket", "alice", None).is_ok());
+        assert!(direct_access_policy("my.bucket-1", "alice", Some("prod")).is_ok());
+    }
+
+    #[test]
+    fn an_owner_that_is_not_one_segment_is_refused() {
+        // The prefix condition is the only thing enforcing ownership here, so
+        // an owner carrying a separator or a traversal would widen it.
+        for bad in ["", "a/b", "..", "a\\b"] {
+            assert!(
+                direct_access_policy("b", bad, None).is_err(),
+                "{bad:?} must not produce a policy"
+            );
+        }
+        assert!(direct_access_policy("", "alice", None).is_err());
     }
 
     #[test]
