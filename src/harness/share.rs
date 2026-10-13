@@ -480,14 +480,16 @@ impl Store for ShareStore {
 /// more than one deployment.
 ///
 /// # Errors
-/// When the bucket is empty, or the owner is not usable as a single key
-/// segment — the prefix condition is the only thing enforcing ownership on
-/// this path, so an owner that is not one segment would widen it silently.
+/// When any value would not name what it appears to name. The condition on
+/// writes is the only thing enforcing ownership on this path, so a value that
+/// widens it has to be refused rather than rendered.
 pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> Result<String> {
-    if bucket.trim().is_empty() {
-        return Err(remote("a bucket name is required"));
-    }
+    checked_bucket(bucket)?;
     crate::harness::checked_id_component(Share::NAME, owner)?;
+    checked_arn_literal("owner", owner)?;
+    if let Some(prefix) = prefix {
+        checked_arn_literal("prefix", prefix)?;
+    }
 
     // `<prefix>/` or nothing, so the resources below read the same either way.
     let root = prefix
@@ -526,6 +528,50 @@ pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> 
     });
     serde_json::to_string_pretty(&policy)
         .map_err(|error| remote(&format!("could not render the policy: {error}")))
+}
+
+/// Reject a value that IAM would read as a pattern rather than a literal.
+///
+/// Every one of these is interpolated into a resource ARN. IAM treats `*` and
+/// `?` as wildcards and `${…}` as a variable, so `--owner '*'` would render
+/// `arn:aws:s3:::bucket/*/*` — Put and Delete over every publisher's
+/// transcripts — while the surrounding text still claimed one prefix. The
+/// policy is the only thing enforcing ownership here, so a value that cannot
+/// be rendered honestly is refused instead.
+fn checked_arn_literal(what: &str, value: &str) -> Result<()> {
+    if let Some(found) = value
+        .chars()
+        .find(|c| matches!(c, '*' | '?' | '$' | '{' | '}'))
+    {
+        return Err(remote(&format!(
+            "the {what} contains `{found}`, which IAM reads as a pattern rather than \
+             a literal; it would grant more than it appears to"
+        )));
+    }
+    Ok(())
+}
+
+/// A bucket name, by S3's rules, which exclude every ARN metacharacter.
+///
+/// Checked rather than trusted because the bucket is interpolated into the
+/// read and list resources: `--bucket '*'` would widen both to every bucket
+/// the identity can see.
+fn checked_bucket(bucket: &str) -> Result<()> {
+    let shaped = (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && bucket.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && bucket.ends_with(|c: char| c.is_ascii_alphanumeric());
+    if shaped {
+        Ok(())
+    } else {
+        Err(remote(&format!(
+            "`{}` is not a bucket name: 3-63 characters of lowercase letters, \
+             digits, `-` and `.`, starting and ending alphanumeric",
+            bucket.escape_debug()
+        )))
+    }
 }
 
 // --- the configured store ---------------------------------------------
@@ -736,6 +782,33 @@ mod tests {
             .find(|s| s["Sid"] == "WriteOnlyMyOwnPrefix")
             .expect("write statement");
         assert_eq!(write["Resource"], "arn:aws:s3:::shared/prod/alice/*");
+    }
+
+    #[test]
+    fn a_value_iam_would_read_as_a_pattern_is_refused() {
+        // Each of these is interpolated into a resource ARN. Rendered, they
+        // would grant far more than the surrounding text claims.
+        for owner in ["*", "a*", "?", "a?b", "${aws:username}", "a$b", "{x}"] {
+            assert!(
+                direct_access_policy("my-bucket", owner, None).is_err(),
+                "owner {owner:?} must not produce a policy"
+            );
+        }
+        for bucket in ["*", "my-*", "MyBucket", "ab", "-abc", "abc-", "a/b", "a b"] {
+            assert!(
+                direct_access_policy(bucket, "alice", None).is_err(),
+                "bucket {bucket:?} must not produce a policy"
+            );
+        }
+        for prefix in ["*", "prod/*", "${x}", "a?"] {
+            assert!(
+                direct_access_policy("my-bucket", "alice", Some(prefix)).is_err(),
+                "prefix {prefix:?} must not produce a policy"
+            );
+        }
+        // And the ordinary shapes still do.
+        assert!(direct_access_policy("my-bucket", "alice", None).is_ok());
+        assert!(direct_access_policy("my.bucket-1", "alice", Some("prod")).is_ok());
     }
 
     #[test]
