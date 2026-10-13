@@ -345,6 +345,8 @@ export TXCRIPT_SHARE_BUCKET=my-txcript-bucket
 export TXCRIPT_SHARE_OWNER=alice          # must match the prefix the policy allows
 export TXCRIPT_SHARE_ENDPOINT=…           # optional: R2, MinIO, Ceph
 export TXCRIPT_SHARE_PREFIX=…             # optional, and must match --prefix above
+                                          # one or more plain segments, e.g. `prod`
+                                          # or `team-a/prod`; `prod//` is refused
 ```
 
 `TXCRIPT_SHARE_OWNER` must match the prefix in the policy, or writes fail on

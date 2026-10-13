@@ -57,15 +57,24 @@ impl S3 {
         }
     }
 
-    #[must_use]
-    pub fn with_root(mut self, root: impl Into<String>) -> Self {
-        let root = root.into();
-        self.root = if root.is_empty() || root.ends_with('/') {
-            root
-        } else {
-            format!("{root}/")
-        };
-        self
+    /// Confine this store to a prefix inside the bucket, so one bucket can
+    /// host several deployments.
+    ///
+    /// The value is canonicalised to exactly one trailing slash, and anything
+    /// with an **empty path segment** is refused rather than carried through.
+    /// `prod//` used to be kept verbatim, which put objects under a key with
+    /// an empty segment and meant two components normalising the prefix
+    /// differently disagreed about where they lived — the policy generator
+    /// granted `prod/alice/*` for objects at `prod//alice/…`, denying every
+    /// write it was generated to permit. One spelling per prefix removes that
+    /// class rather than fixing one instance of it.
+    ///
+    /// # Errors
+    /// When the prefix has an empty, `.` or `..` segment, or a control
+    /// character.
+    pub fn with_root(mut self, root: impl Into<String>) -> Result<Self, StoreError> {
+        self.root = checked_root(&root.into())?;
+        Ok(self)
     }
 
     fn object_key(&self, key: &Key) -> String {
@@ -106,6 +115,40 @@ fn classify<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkError<E>) -> S
     } else {
         StoreError::Backend(format!("{error:?}"))
     }
+}
+
+/// A prefix as exactly one canonical string, or a reason it is not one.
+///
+/// Empty means no prefix. Otherwise every segment has to be a real segment:
+/// `prod//x`, `/prod` and `prod/../x` name something other than they appear
+/// to, and silently rewriting them would be a second normalisation for
+/// callers to disagree with.
+fn checked_root(root: &str) -> Result<String, StoreError> {
+    if root.is_empty() {
+        return Ok(String::new());
+    }
+    let body = root.strip_suffix('/').unwrap_or(root);
+    let refuse = |why: &str| {
+        Err(StoreError::Backend(format!(
+            "`{}` is not usable as a prefix: {why}",
+            root.escape_debug()
+        )))
+    };
+    if body.is_empty() {
+        return refuse("it names the bucket root, which is an empty prefix");
+    }
+    for segment in body.split('/') {
+        if segment.is_empty() {
+            return refuse("it has an empty path segment");
+        }
+        if segment == "." || segment == ".." {
+            return refuse("`.` and `..` are not path segments here");
+        }
+        if segment.chars().any(char::is_control) {
+            return refuse("it contains a control character");
+        }
+    }
+    Ok(format!("{body}/"))
 }
 
 fn attrs_from(metadata: Option<&std::collections::HashMap<String, String>>) -> Attrs {

@@ -1457,7 +1457,7 @@ fn cmd_s3_policy(
     // Through the same normalisation the store and the policy use, so the
     // scope printed is the scope granted. An unset variable arrives as an
     // empty string, which is no prefix rather than an empty level.
-    let root = key_root(prefix);
+    let root = key_root(prefix).map_err(|e| e.to_string())?;
     let scope = format!("{bucket}/{root}{owner}/");
     eprintln!("IAM policy for `{owner}`, who may write only {scope}");
     eprintln!();

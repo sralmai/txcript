@@ -27,10 +27,12 @@ impl Store {
     ///
     /// Async because the S3 client resolves credentials from the ambient
     /// chain at construction, which can reach the network.
-    pub async fn build(config: &StoreConfig) -> Self {
+    /// # Errors
+    /// When the configuration names a prefix that is not usable as one.
+    pub async fn build(config: &StoreConfig) -> Result<Self, StoreError> {
         match config {
-            StoreConfig::Filesystem { root } => Store::Filesystem(Filesystem::new(root)),
-            StoreConfig::Memory => Store::Memory(InMemory::new()),
+            StoreConfig::Filesystem { root } => Ok(Store::Filesystem(Filesystem::new(root))),
+            StoreConfig::Memory => Ok(Store::Memory(InMemory::new())),
             #[cfg(feature = "s3")]
             StoreConfig::S3 {
                 bucket,
@@ -46,10 +48,10 @@ impl Store {
                 }
                 let client = aws_sdk_s3::Client::from_conf(builder.build());
                 let store = txcript_share_store::S3::new(client, bucket.clone());
-                Store::S3(match root {
-                    Some(root) => store.with_root(root.clone()),
+                Ok(Store::S3(match root {
+                    Some(root) => store.with_root(root.clone())?,
                     None => store,
-                })
+                }))
             }
         }
     }

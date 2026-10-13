@@ -106,7 +106,9 @@ impl DirectStore {
         let client = aws_sdk_s3::Client::from_conf(builder.build());
         let mut inner = S3::new(client, bucket);
         if let Some(prefix) = env("TXCRIPT_SHARE_PREFIX") {
-            inner = inner.with_root(prefix);
+            inner = inner
+                .with_root(prefix)
+                .map_err(|error| store_error(&error))?;
         }
 
         crate::harness::checked_id_component(Share::NAME, &owner)?;

@@ -497,7 +497,7 @@ pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> 
         checked_arn_literal("prefix", prefix)?;
     }
 
-    let root = key_root(prefix);
+    let root = key_root(prefix)?;
     let bucket_arn = format!("arn:aws:s3:::{bucket}");
 
     let policy = serde_json::json!({
@@ -532,18 +532,42 @@ pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> 
 
 /// The key prefix the store will actually use, given a configured prefix.
 ///
-/// **Must match `S3::with_root`.** It appends one `/` only when the value does
-/// not already end in one, and trims nothing — so `prod//` stays `prod//` and
-/// the objects live under `prod//alice/…`. Normalising differently here, by
-/// stripping every trailing slash, produced a policy for `prod/alice/*` and
-/// denied every push it was generated to permit.
-#[must_use]
-pub fn key_root(prefix: Option<&str>) -> String {
-    match prefix {
-        None => String::new(),
-        Some(prefix) if prefix.is_empty() || prefix.ends_with('/') => prefix.to_string(),
-        Some(prefix) => format!("{prefix}/"),
+/// **Must match `S3::with_root`**, which canonicalises to exactly one trailing
+/// slash and refuses an empty path segment. The rule is stated twice because
+/// this has to work in a build without the S3 backend — someone needs the
+/// rules before they have a binary that can use them — so a test pins the two
+/// against each other.
+///
+/// # Errors
+/// When the prefix has an empty, `.` or `..` segment, or a control character.
+/// Those are refused rather than rewritten: a second normalisation is one more
+/// thing for two components to disagree about, which is the bug this replaced.
+pub fn key_root(prefix: Option<&str>) -> Result<String> {
+    let Some(prefix) = prefix.filter(|prefix| !prefix.is_empty()) else {
+        return Ok(String::new());
+    };
+    let body = prefix.strip_suffix('/').unwrap_or(prefix);
+    let refuse = |why: &str| {
+        Err(remote(&format!(
+            "`{}` is not usable as a prefix: {why}",
+            prefix.escape_debug()
+        )))
+    };
+    if body.is_empty() {
+        return refuse("it names the bucket root, which is an empty prefix");
     }
+    for segment in body.split('/') {
+        if segment.is_empty() {
+            return refuse("it has an empty path segment");
+        }
+        if segment == "." || segment == ".." {
+            return refuse("`.` and `..` are not path segments here");
+        }
+        if segment.chars().any(char::is_control) {
+            return refuse("it contains a control character");
+        }
+    }
+    Ok(format!("{body}/"))
 }
 
 /// Reject a value that IAM would read as a pattern rather than a literal.
@@ -785,12 +809,16 @@ mod tests {
         // trailing slash added only when absent, and nothing trimmed. A policy
         // built from a different normalisation denies the pushes it exists to
         // allow.
-        assert_eq!(key_root(None), "");
-        assert_eq!(key_root(Some("")), "");
-        assert_eq!(key_root(Some("prod")), "prod/");
-        assert_eq!(key_root(Some("prod/")), "prod/");
-        assert_eq!(key_root(Some("prod//")), "prod//");
-        assert_eq!(key_root(Some("a/b")), "a/b/");
+        assert_eq!(key_root(None).ok(), Some(String::new()));
+        assert_eq!(key_root(Some("")).ok(), Some(String::new()));
+        assert_eq!(key_root(Some("prod")).ok(), Some("prod/".to_string()));
+        assert_eq!(key_root(Some("prod/")).ok(), Some("prod/".to_string()));
+        assert_eq!(key_root(Some("a/b")).ok(), Some("a/b/".to_string()));
+        // One spelling per prefix: an empty segment names something other
+        // than it appears to, and is refused rather than rewritten.
+        for bad in ["prod//", "/prod", "//", "/", "prod/../x", "prod/./x"] {
+            assert!(key_root(Some(bad)).is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[test]

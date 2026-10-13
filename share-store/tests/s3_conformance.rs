@@ -71,7 +71,9 @@ async fn s3_satisfies_the_store_contract() {
     let run = run_id();
     conformance::all(|| {
         counter.set(counter.get() + 1);
-        S3::new(client.clone(), name).with_root(format!("case-{}-{run}", counter.get()))
+        S3::new(client.clone(), name)
+            .with_root(format!("case-{}-{run}", counter.get()))
+            .expect("prefix")
     })
     .await;
 }
@@ -98,7 +100,9 @@ async fn a_conditional_create_is_atomic() {
     };
     let name = "txcript-share-conformance";
     bucket(&client, name).await;
-    let store = S3::new(client, name).with_root(format!("race-{}", run_id()));
+    let store = S3::new(client, name)
+        .with_root(format!("race-{}", run_id()))
+        .expect("prefix");
     let key = conformance::key("alice", "contested");
 
     // Issued together, not one after the other. Awaited sequentially, this
@@ -145,7 +149,9 @@ async fn a_foreign_key_does_not_truncate_a_listing() {
     let name = "txcript-share-conformance";
     bucket(&client, name).await;
     let root = format!("foreign-{}", run_id());
-    let store = S3::new(client.clone(), name).with_root(root.clone());
+    let store = S3::new(client.clone(), name)
+        .with_root(root.clone())
+        .expect("prefix");
 
     for n in 0..6 {
         store
