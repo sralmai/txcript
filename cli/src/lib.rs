@@ -802,8 +802,6 @@ mod filter_tests {
         ));
     }
 
-    /// `pull` with no destination writes a document, never into a harness's
-    /// store: nothing on this machine should be surprised by a fetch.
     #[test]
     #[cfg(feature = "share")]
     fn s3_policy_takes_its_values_from_flags_or_the_environment() {
@@ -837,6 +835,8 @@ mod filter_tests {
         assert_eq!(prefix.as_deref(), Some("prod"));
     }
 
+    /// `pull` with no destination writes a document, never into a harness's
+    /// store: nothing on this machine should be surprised by a fetch.
     #[test]
     fn pull_defaults_to_a_document_from_share() {
         use clap::Parser as _;
