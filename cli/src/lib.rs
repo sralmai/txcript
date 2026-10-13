@@ -1446,7 +1446,7 @@ fn cmd_s3_policy(
     owner: Option<String>,
     prefix: Option<&str>,
 ) -> Result<ExitCode, String> {
-    use txcript::harness::share::direct_access_policy;
+    use txcript::harness::share::{direct_access_policy, key_root};
 
     // clap has already applied the environment fallbacks.
     let bucket = bucket.ok_or("no bucket: pass --bucket, or set TXCRIPT_SHARE_BUCKET")?;
@@ -1454,10 +1454,11 @@ fn cmd_s3_policy(
 
     let policy = direct_access_policy(&bucket, &owner, prefix).map_err(|e| e.to_string())?;
 
-    let scope = prefix.map_or_else(
-        || format!("{bucket}/{owner}/"),
-        |prefix| format!("{bucket}/{}/{owner}/", prefix.trim_end_matches('/')),
-    );
+    // Through the same normalisation the store and the policy use, so the
+    // scope printed is the scope granted. An unset variable arrives as an
+    // empty string, which is no prefix rather than an empty level.
+    let root = key_root(prefix);
+    let scope = format!("{bucket}/{root}{owner}/");
     eprintln!("IAM policy for `{owner}`, who may write only {scope}");
     eprintln!();
     eprintln!("This is an identity policy: attach it to the user, role or token");
@@ -1468,8 +1469,11 @@ fn cmd_s3_policy(
     eprintln!("Then publish with:");
     eprintln!("    export TXCRIPT_SHARE_BUCKET={bucket}");
     eprintln!("    export TXCRIPT_SHARE_OWNER={owner}");
-    if let Some(prefix) = prefix {
-        eprintln!("    export TXCRIPT_SHARE_PREFIX={prefix}");
+    if !root.is_empty() {
+        eprintln!(
+            "    export TXCRIPT_SHARE_PREFIX={}",
+            root.trim_end_matches('/')
+        );
     }
     eprintln!("    txcript push <session-id>");
     eprintln!();

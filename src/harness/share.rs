@@ -497,13 +497,7 @@ pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> 
         checked_arn_literal("prefix", prefix)?;
     }
 
-    // `<prefix>/` or nothing, so the resources below read the same either way.
-    let root = prefix
-        .map(str::trim)
-        .filter(|prefix| !prefix.is_empty())
-        .map_or_else(String::new, |prefix| {
-            format!("{}/", prefix.trim_end_matches('/'))
-        });
+    let root = key_root(prefix);
     let bucket_arn = format!("arn:aws:s3:::{bucket}");
 
     let policy = serde_json::json!({
@@ -534,6 +528,22 @@ pub fn direct_access_policy(bucket: &str, owner: &str, prefix: Option<&str>) -> 
     });
     serde_json::to_string_pretty(&policy)
         .map_err(|error| remote(&format!("could not render the policy: {error}")))
+}
+
+/// The key prefix the store will actually use, given a configured prefix.
+///
+/// **Must match `S3::with_root`.** It appends one `/` only when the value does
+/// not already end in one, and trims nothing — so `prod//` stays `prod//` and
+/// the objects live under `prod//alice/…`. Normalising differently here, by
+/// stripping every trailing slash, produced a policy for `prod/alice/*` and
+/// denied every push it was generated to permit.
+#[must_use]
+pub fn key_root(prefix: Option<&str>) -> String {
+    match prefix {
+        None => String::new(),
+        Some(prefix) if prefix.is_empty() || prefix.ends_with('/') => prefix.to_string(),
+        Some(prefix) => format!("{prefix}/"),
+    }
 }
 
 /// Reject a value that IAM would read as a pattern rather than a literal.
@@ -766,6 +776,30 @@ mod tests {
         assert_eq!(
             resource_of("WriteOnlyMyOwnPrefix"),
             "arn:aws:s3:::my-bucket/alice/*"
+        );
+    }
+
+    #[test]
+    fn the_key_root_matches_what_the_store_will_use() {
+        // Pinned against `S3::with_root`, which these have to agree with: one
+        // trailing slash added only when absent, and nothing trimmed. A policy
+        // built from a different normalisation denies the pushes it exists to
+        // allow.
+        assert_eq!(key_root(None), "");
+        assert_eq!(key_root(Some("")), "");
+        assert_eq!(key_root(Some("prod")), "prod/");
+        assert_eq!(key_root(Some("prod/")), "prod/");
+        assert_eq!(key_root(Some("prod//")), "prod//");
+        assert_eq!(key_root(Some("a/b")), "a/b/");
+    }
+
+    #[test]
+    fn an_empty_prefix_is_the_same_policy_as_no_prefix() {
+        let none = direct_access_policy("my-bucket", "alice", None).expect("policy");
+        let empty = direct_access_policy("my-bucket", "alice", Some("")).expect("policy");
+        assert_eq!(
+            none, empty,
+            "an unset variable reads as empty, not as a level"
         );
     }
 
