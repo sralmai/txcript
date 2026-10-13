@@ -181,8 +181,18 @@ policy each publisher needs:
 
 ```sh
 nix profile install github:skillsynchq/txcript#txcript-s3
+
+# Print the policy, then attach it to the identity that publishes
 txcript s3-policy --bucket my-bucket --owner alice > policy.json
+
+export TXCRIPT_SHARE_BUCKET=my-bucket
+export TXCRIPT_SHARE_OWNER=alice      # the one prefix this identity may write
+txcript push <session-id>
 ```
+
+Give every publisher their own owner prefix: the condition on writes is the
+only thing enforcing ownership here, so a wider policy lets any publisher
+overwrite any other's transcripts.
 
 See [Deploying a share service](docs/deploy.md).
 
