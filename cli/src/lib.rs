@@ -1435,11 +1435,6 @@ fn crop_loaded(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `push` — write a copy into a harness's store and stop.
-///
-/// Deliberately a thin wrapper over the same path `continue` uses, so the
-/// two cannot disagree about what writing a session means. The difference is
-/// the name and the absence of a launch.
 /// `s3-policy` — print the rules a direct-to-bucket publisher needs.
 ///
 /// stdout is the policy alone so it can be redirected to a file; stderr
@@ -1491,6 +1486,11 @@ fn cmd_s3_policy(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `push` — write a copy into a harness's store and stop.
+///
+/// Deliberately a thin wrapper over the same path `continue` uses, so the
+/// two cannot disagree about what writing a session means. The difference is
+/// the name and the absence of a launch.
 fn cmd_push(
     id: &str,
     to: HarnessId,
