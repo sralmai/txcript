@@ -37,6 +37,13 @@ Download a binary for macOS, Linux, or Windows from [Releases](https://github.co
 cargo install --git https://github.com/skillsynchq/txcript txcript-cli --locked
 ```
 
+With Nix, run it without installing anything, or install it for real:
+
+```sh
+nix run github:skillsynchq/txcript -- list
+nix profile install github:skillsynchq/txcript
+```
+
 Find a Claude Code session and continue it in Codex:
 
 ```sh
@@ -166,6 +173,16 @@ service must have something authenticating in front of it; HTTPS alone leaves
 them readable by anyone with the URL. Cloudflare Access is the documented
 gate, and the service verifies its assertion itself rather than trusting a
 header.
+
+There is a third option if everyone already has credentials for one bucket:
+publish straight to S3, with no service to run at all. Ownership is then
+enforced by the bucket's own policy, and `txcript s3-policy` prints the one it
+needs:
+
+```sh
+nix profile install github:skillsynchq/txcript#txcript-s3
+txcript s3-policy --bucket my-bucket --owner alice > policy.json
+```
 
 See [Deploying a share service](docs/deploy.md).
 

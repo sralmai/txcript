@@ -7,18 +7,33 @@ API, and why nothing in a Terraform module needs to know how to compile Rust.
 
 | file | produces |
 |---|---|
-| `package.nix` | the service binary — every other artifact is derived from it |
+| `cli.nix` | the `txcript` CLI — the tool a person installs, and the flake default |
+| `package.nix` | the service binary — every other service artifact derives from it |
 | `container.nix` | an OCI image: the binary's closure, no base image, no distro |
 | `module.nix` | the NixOS systemd service |
 | `cloudflare-access.nix` | `cloudflared` + Access, as a *separate* import |
 
 ```sh
-nix build .#share-server            # the binary
+nix run  github:skillsynchq/txcript -- list   # the CLI, without installing
+nix build .#txcript                 # the CLI (the default)
+nix build .#txcript-s3              # the CLI, publishing straight to a bucket
+nix build .#share-server            # the service binary
 nix build .#share-server-s3         # with the S3 backend compiled in
 nix build .#share-server-access     # with Access verification compiled in
 nix build .#share-server-s3-access  # both
 nix build .#container               # OCI image, loadable with `docker load -i`
 ```
+
+## Why the CLI has its own file
+
+The two binaries have genuinely different build needs, not merely different
+flags. The service links nothing but its own closure. The CLI pulls the
+browser-compatible HTTPS transport the live web stores use, which compiles
+BoringSSL from source — so it needs `cmake`, `perl`, `clang` with
+`LIBCLANG_PATH` pointed at libclang, and a `git` on `PATH`, because
+`boring-sys` patches its vendored copy through `git init` and `git apply`.
+None of that reaches the runtime closure, and none of it belongs in the
+service's build.
 
 ## Why the build toolchain is minimal
 

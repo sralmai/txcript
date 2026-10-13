@@ -85,11 +85,26 @@
         };
 
         share-server = pkgs.callPackage ./nix/package.nix { inherit rustPlatform; };
+
+        # The CLI, which is the tool people install. Built with the same
+        # minimal toolchain as the service, for the same closure reasons.
+        txcript = pkgs.callPackage ./nix/cli.nix { inherit rustPlatform; };
       in
       {
         packages = {
-          default = share-server;
-          inherit share-server;
+          # The CLI: `nix run github:skillsynchq/txcript` should give someone
+          # `txcript`, not the service that happens to back one of its
+          # features. The hosts are still here by name.
+          default = txcript;
+          inherit txcript share-server;
+
+          # The CLI with the direct-to-bucket backend compiled in, for
+          # publishing to S3 with no service in the path. `txcript s3-policy`
+          # prints the bucket policy that path requires.
+          txcript-s3 = pkgs.callPackage ./nix/cli.nix {
+            inherit rustPlatform;
+            features = [ "share_s3" ];
+          };
 
           # The same host with the S3 backend compiled in. Separate because a
           # filesystem deployment should not ship or audit the AWS client.
