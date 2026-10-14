@@ -467,10 +467,16 @@ impl Store for ShareStore {
 /// list the bucket, write only its own prefix.
 ///
 /// An *identity* policy — it carries no `Principal` and is attached to the
-/// user, role or token that publishes. It is deliberately not a bucket policy:
+/// user or role that publishes. It is deliberately not a bucket policy:
 /// `put-bucket-policy` would reject it for the missing `Principal`, and the
 /// permissions belong to the publisher rather than to the bucket, since each
 /// publisher gets a different prefix.
+///
+/// **This is IAM, which R2 is not.** An ordinary R2 API token is scoped to a
+/// bucket rather than to a key prefix, so it cannot express the condition
+/// that makes ownership real here; only R2's temporary access credentials
+/// take a policy document. The rules are still the right description of what
+/// the bucket needs — they are simply not attachable on that provider.
 ///
 /// Deliberately *not* behind `share_s3`. The rules have to be in place before
 /// the identity they describe can publish anything, so a stock build has to be

@@ -219,9 +219,19 @@ pub struct Page {
 /// `PreconditionFailed` is separate from `Backend` because it is the
 /// caller's business — a concurrent writer won, and the host must return 412
 /// rather than 500.
+///
+/// `Denied` is separate for the same reason: the store understood the
+/// request and refused it, which is a fact about the credentials rather than
+/// about the store's health. It is also not always distinguishable from
+/// absence — see [`S3`](crate::S3), where a restricted identity is told 403
+/// for a key that is merely missing — so callers that can tell the two apart
+/// have to be able to see which one they got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
     PreconditionFailed,
+    /// The credentials are not allowed to do this, or the object is absent
+    /// and the backend will not say which.
+    Denied,
     Backend(String),
 }
 
@@ -229,6 +239,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::PreconditionFailed => f.write_str("object changed since it was read"),
+            StoreError::Denied => f.write_str("the object store refused access"),
             StoreError::Backend(detail) => write!(f, "store backend failed: {detail}"),
         }
     }

@@ -103,6 +103,12 @@ impl S3 {
 /// The 409 is matched on its code rather than its status: `OperationAborted`
 /// is also a 409 and is *not* a precondition failure, so reporting it as one
 /// told a caller its object had changed when it had sent no precondition.
+///
+/// 403 is [`StoreError::Denied`] rather than `Backend`, because a refusal is
+/// a fact about the credentials and not about the store being unwell. It is
+/// the normal answer for a publisher writing outside its own prefix, and —
+/// see [`is_missing`] — the answer a restricted identity gets for an object
+/// that is simply not there.
 fn classify<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkError<E>) -> StoreError {
     let status = match error {
         SdkError::ServiceError(inner) => inner.raw().status().as_u16(),
@@ -112,6 +118,8 @@ fn classify<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkError<E>) -> S
         status == 412 || (status == 409 && error.code() == Some("ConditionalRequestConflict"));
     if conflicted {
         StoreError::PreconditionFailed
+    } else if status == 403 {
+        StoreError::Denied
     } else {
         StoreError::Backend(format!("{error:?}"))
     }
@@ -311,9 +319,20 @@ impl ObjectStore for S3 {
             };
             // `ListObjectsV2` does not return user metadata, so attributes
             // cost one HEAD each. See the module note.
-            let attrs = match self.head(&key).await? {
-                Some(meta) => meta.attrs,
-                None => continue,
+            let attrs = match self.head(&key).await {
+                Ok(Some(meta)) => meta.attrs,
+                // Absence and refusal are one event here. The key came back
+                // from the listing a moment ago, so either way the object
+                // went away underneath us; it arrives as 403 rather than 404
+                // because the policy `txcript s3-policy` prints grants
+                // `s3:ListBucket` only under an `s3:prefix` condition, which
+                // a `HeadObject` request does not carry, and S3 will not
+                // confirm absence to an identity that cannot list.
+                // Credentials that genuinely cannot read have already failed
+                // the listing above, so skipping here cannot swallow a
+                // broken policy and hand back an empty page.
+                Ok(None) | Err(StoreError::Denied) => continue,
+                Err(error) => return Err(error),
             };
             objects.push(Self::meta_from(
                 key,
@@ -336,6 +355,15 @@ impl ObjectStore for S3 {
 /// and every listing empty, instead of the 5xx a misconfiguration deserves.
 /// `HeadObject` has no response body and so no code, which is why the test is
 /// for the bucket error rather than for the key error.
+///
+/// **Absence is not always a 404.** S3 answers `GetObject` and `HeadObject`
+/// for a missing key with 404 only if the caller holds `s3:ListBucket`;
+/// without it the answer is 403, so that absence cannot be used to probe for
+/// keys. The policy `txcript s3-policy` prints grants `s3:ListBucket` under
+/// an `s3:prefix` condition, and neither request carries that key, so a
+/// direct-to-bucket publisher takes the 403 path: a missing object arrives
+/// as [`StoreError::Denied`], never as `Ok(None)`. Callers that need to tell
+/// absence from refusal cannot, and have to say so.
 fn is_missing<E: std::fmt::Debug + ProvideErrorMetadata>(error: &SdkError<E>) -> bool {
     matches!(error, SdkError::ServiceError(inner)
         if inner.raw().status().as_u16() == 404 && error.code() != Some("NoSuchBucket"))
