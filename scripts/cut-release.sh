@@ -89,8 +89,13 @@ fi
 
 # --- preflight --------------------------------------------------------
 
-for tool in git gh cargo node git-cliff; do
-  command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"
+# node is deliberately not here: nothing on this path needs it. The version
+# bump is sed and cargo, the changelog is awk.
+for tool in git gh cargo git-cliff; do
+  command -v "$tool" >/dev/null 2>&1 \
+    || die "$tool is not installed. \`nix develop\` has all of these; otherwise
+install it directly (git-cliff: \`brew install git-cliff\`, or
+\`cargo install git-cliff\`)."
 done
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated: run \`gh auth login\`"
 

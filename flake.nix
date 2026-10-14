@@ -58,6 +58,17 @@
           wrangler
         ];
 
+        # Cutting a release. `scripts/cut-release.sh` derives the version and
+        # the changelog section with git-cliff, and uses gh to follow the run
+        # the tag starts. CI pins git-cliff exactly, through
+        # taiki-e/install-action, at the version nixpkgs carries here. They
+        # are worth keeping level, since the changelog section is git-cliff's
+        # output and a maintainer cutting by hand should get what CI would.
+        releaseDeps = with pkgs; [
+          git-cliff
+          gh
+        ];
+
         shellFor = toolchain: extra: pkgs.mkShell {
           packages = [ toolchain ] ++ nativeDeps ++ darwinDeps ++ extra;
 
@@ -135,11 +146,12 @@
         };
 
         devShells = {
-          # `nix develop` — everything CI needs except the npm packaging step.
-          default = shellFor rust [ ];
+          # `nix develop` — everything CI needs except the npm packaging step,
+          # plus what it takes to cut a release.
+          default = shellFor rust releaseDeps;
 
           # `nix develop .#js` — adds the wasm-bindgen/bun/node toolchain.
-          js = shellFor rust jsDeps;
+          js = shellFor rust (releaseDeps ++ jsDeps);
 
           # `nix develop .#msrv` — reproduces the CI msrv job exactly.
           msrv = shellFor msrv [ ];
