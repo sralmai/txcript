@@ -204,12 +204,24 @@ impl Store for DirectStore {
         let key = Key::parse(&reference.slug)
             .ok_or_else(|| remote("that is not a `<owner>/<session>` slug"))?;
         self.runtime.block_on(async {
-            let object = self
-                .inner
-                .get(&key)
-                .await
-                .map_err(|error| store_error(&error))?
-                .ok_or_else(|| remote("no such transcript"))?;
+            let object = match self.inner.get(&key).await {
+                Ok(Some(object)) => object,
+                Ok(None) => return Err(remote("no such transcript")),
+                // Absence and refusal are the same answer on this path. The
+                // policy `txcript s3-policy` prints grants `s3:ListBucket`
+                // only under an `s3:prefix` condition, and a `GetObject`
+                // request carries no such key, so S3 declines to distinguish
+                // a missing object from an unreadable one and returns 403
+                // for both. Saying only "no such transcript" would send
+                // someone with a misattached policy hunting for a slug that
+                // is there.
+                Err(StoreError::Denied) => {
+                    return Err(remote(
+                        "no such transcript, or the bucket policy does not allow reading it",
+                    ));
+                }
+                Err(error) => return Err(store_error(&error)),
+            };
             let text = std::str::from_utf8(&object.body)
                 .map_err(|error| remote(&format!("the transcript was not UTF-8: {error}")))?;
             let mut transcript = Share::from_text(text)?;
