@@ -8,6 +8,12 @@ name: release
 # Tags come from prepare-release.yml. A hand-pushed `vX.Y.Z` tag works too,
 # as long as the manifests and changelog already carry that version.
 #
+# On a fork: set the repository variable `PUBLISH_NPM` to `false` and a tag
+# gets you binaries and a GitHub Release without the npm publish, which a
+# fork cannot do. prepare-release.yml needs more than that — a GitHub App in
+# `RELEASE_APP_ID` / `RELEASE_APP_KEY` — so bump the manifests and the
+# changelog by hand there and push the tag yourself.
+#
 # npm trusted publishing is bound to this filename.
 on:
   push:
@@ -45,7 +51,7 @@ jobs:
           done
           echo "version=$tag" >> "$GITHUB_OUTPUT"
       - name: Changelog has this version
-        run: .github/scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md && cat notes.md
+        run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md && cat notes.md
       - uses: actions/upload-artifact@v4
         with:
           name: release-notes
@@ -57,13 +63,22 @@ jobs:
   # dry-run gates in ci.yml and prepare-release.yml at the same time, or the
   # break lands after the tag is pushed and after npm has published.
 
+  # Trusted publishing is bound to this repository *and* this workflow
+  # filename on npmjs, and a fork does not own the `txcript` name, so the job
+  # can only fail there. Set the repository variable `PUBLISH_NPM` to `false`
+  # on a fork to skip it; unset means publish, so nothing changes upstream.
   npm:
     name: Publish to npm
+    if: vars.PUBLISH_NPM != 'false'
     needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+    outputs:
+      # The link the release notes get, from the manifest that was actually
+      # published rather than from a name written down twice.
+      url: ${{ steps.publish.outputs.url }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -83,7 +98,13 @@ jobs:
       # Trusted publishing needs npm >= 11.5.1; Node 24 can bundle older.
       - run: npm install -g npm@latest
       - run: bun run build
-      - run: npm publish --access public --ignore-scripts
+      - id: publish
+        run: |
+          set -eu
+          npm publish --access public --ignore-scripts
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          echo "url=https://www.npmjs.com/package/$name/v/$version" >> "$GITHUB_OUTPUT"
 
   binaries:
     name: Build CLI binaries
@@ -93,6 +114,17 @@ jobs:
   github-release:
     name: Create GitHub Release
     needs: [verify, npm, binaries]
+    # A release page must never point at a package that is not there, so a
+    # *failed* npm publish still blocks this. A *skipped* one does not: a
+    # fork that has opted out of npm has nothing to be out of step with, and
+    # would otherwise get no release at all. `always()` is what lets the job
+    # run with a skipped dependency; the rest restores the gating it removes.
+    if: >-
+      always()
+      && needs.verify.result == 'success'
+      && needs.binaries.result == 'success'
+      && needs.npm.result != 'failure'
+      && needs.npm.result != 'cancelled'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -103,9 +135,18 @@ jobs:
       - name: Create release with notes and binaries
         env:
           GH_TOKEN: ${{ github.token }}
+          NPM_URL: ${{ needs.npm.outputs.url }}
         run: |
           set -eu
           ls -R artifacts
+          # One link per package this run actually published. A fork that
+          # skips npm says nothing rather than pointing at a package it does
+          # not own, and there is no crates.io link because there is no
+          # crates.io job.
+          if [ -n "$NPM_URL" ]; then
+            printf '\n---\n\n- npm: %s\n' "$NPM_URL" >> artifacts/release-notes/notes.md
+          fi
+          cat artifacts/release-notes/notes.md
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
