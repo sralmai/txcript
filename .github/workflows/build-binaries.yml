@@ -46,7 +46,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - run: cargo build --release --locked -p txcript-cli --target ${{ matrix.target }}
+      # share_s3 is opt-in in Cargo.toml; the fork ships it so `txcript push`
+      # can publish straight to a bucket (the devvm installs these archives).
+      - run: cargo build --release --locked -p txcript-cli --features share_s3 --target ${{ matrix.target }}
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
