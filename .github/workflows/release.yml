@@ -51,7 +51,7 @@ jobs:
           done
           echo "version=$tag" >> "$GITHUB_OUTPUT"
       - name: Changelog has this version
-        run: .github/scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md && cat notes.md
+        run: scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md && cat notes.md
       - uses: actions/upload-artifact@v4
         with:
           name: release-notes

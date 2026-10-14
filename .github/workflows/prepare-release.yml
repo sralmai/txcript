@@ -54,20 +54,14 @@ jobs:
           tool: git-cliff@2.14.1
       - name: Resolve version
         id: version
+        env:
+          INPUT: ${{ inputs.version }}
         run: |
           set -eu
-          input='${{ inputs.version }}'
-          if [ -n "$input" ]; then
-            ver="${input#v}"
-          else
-            ver="$(git-cliff --bumped-version 2>/dev/null)"
-            ver="${ver#v}"
-          fi
-          echo "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::not a version: $ver"; exit 1; }
-          current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          [ "$ver" != "$current" ] || { echo "::error::$ver is already the current version"; exit 1; }
-          [ "$(printf '%s\n%s\n' "$current" "$ver" | sort -V | tail -1)" = "$ver" ] || { echo "::error::$ver is below current $current"; exit 1; }
-          ! git rev-parse -q --verify "refs/tags/v$ver" >/dev/null || { echo "::error::tag v$ver already exists"; exit 1; }
+          # Same script, same rules, as the tag job and as a hand-cut
+          # release. Its failures are already specific, so they stand.
+          # shellcheck disable=SC2086
+          ver="$(scripts/cut-release.sh --resolve-version $INPUT)"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
       - name: Show the plan
         run: |
@@ -122,46 +116,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
           APP_SLUG: ${{ steps.app.outputs.app-slug }}
-      - name: Build the release commit and push it with its tag
+      - name: Cut the release
         env:
           VERSION: ${{ needs.plan.outputs.version }}
-          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          EXPLICIT: ${{ inputs.version }}
           GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
         run: |
           set -eu
-          tag="v$VERSION"
-          for attempt in 1 2 3 4 5; do
-            git fetch origin main
-            git reset -q --hard origin/main
-            git tag -d "$tag" 2>/dev/null || true
-            # Without an explicit version, the bump must still be what was
-            # approved; a feat landing mid-run would change it.
-            if [ -z '${{ inputs.version }}' ]; then
-              now="$(git-cliff --bumped-version 2>/dev/null)"
-              [ "${now#v}" = "$VERSION" ] || { echo "::error::main moved and the derived version is now ${now#v}, not $VERSION; rerun"; exit 1; }
-            fi
-            git-cliff --unreleased --tag "$tag" --strip all 2>/dev/null > section.md
-            .github/scripts/changelog-insert.sh section.md
-            rm section.md
-            .github/scripts/bump-version.sh "$VERSION"
-            git add Cargo.toml Cargo.lock cli/Cargo.toml package.json CHANGELOG.md
-            git commit -q -m "chore(release): $tag"
-            # No publish dry-run here: `share_s3` depends on two
-            # `publish = false` crates, so the manifest is not publishable.
-            # See the note in ci.yml.
-            git tag -a "$tag" -m "$tag"
-            if git push --atomic origin HEAD:main "refs/tags/$tag"; then
-              echo "pushed $tag on $(git rev-parse --short HEAD) (attempt $attempt)"
-              # The App's push starts release.yml on its own. GITHUB_TOKEN's
-              # does not — that is the recursion guard — so the fallback has
-              # to ask for the run, on the tag it just pushed.
-              if [ -z "$APP_SLUG" ]; then
-                gh workflow run release.yml --ref "$tag"
-                echo "dispatched release.yml on $tag"
-              fi
-              exit 0
-            fi
-            echo "main moved during attempt $attempt; rebuilding on the new head"
-          done
-          echo "::error::could not land the release commit after 5 attempts"
-          exit 1
+          # The same script a maintainer runs by hand. It rebuilds the
+          # commit on the new head if main moves, and starts release.yml
+          # itself when the push was made with GITHUB_TOKEN and so did not.
+          # Passing the version only when it was given keeps the guard that
+          # refuses a derived bump that changed mid-run.
+          if [ -n "$EXPLICIT" ]; then
+            scripts/cut-release.sh "$VERSION" --yes --no-watch
+          else
+            scripts/cut-release.sh --yes --no-watch
+          fi
