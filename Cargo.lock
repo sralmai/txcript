@@ -3927,7 +3927,7 @@ dependencies = [
 
 [[package]]
 name = "txcript"
-version = "0.14.4"
+version = "0.15.0"
 dependencies = [
  "aes",
  "aws-config",
@@ -3961,7 +3961,7 @@ dependencies = [
 
 [[package]]
 name = "txcript-cli"
-version = "0.14.4"
+version = "0.15.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

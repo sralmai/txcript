@@ -9,6 +9,46 @@ Each release is published to [crates.io](https://crates.io/crates/txcript),
 [npm](https://www.npmjs.com/package/txcript), and
 [GitHub Releases](https://github.com/skillsynchq/txcript/releases).
 
+## [0.15.0](https://github.com/skillsynchq/txcript/compare/v0.14.4...v0.15.0) - 2026-10-14
+
+### Added
+
+- Sans-IO authorization core with seam doubles and an access matrix
+- ObjectStore and Catalog seams with a shared conformance suite
+- Native HTTP host for the transcript service
+- S3-compatible object store, verified against the suite
+- Worker as a thin wasm shell over the decision core
+- Client Store, and an integration test of both halves together
+- Deployable share service, with push and pull ([#18](https://github.com/skillsynchq/txcript/pull/18))
+- Ship the CLI via Nix, and print the bucket policy it needs ([#20](https://github.com/skillsynchq/txcript/pull/20))
+
+### Changed
+
+- Merge pull request #1 from sralmai/fix/harness-skill-wiring
+- Merge pull request #3 from sralmai/chore/nix-flake
+- Extract the shared browser HTTP transport into src/http.rs
+- Clean up three defects found by the first real build
+- Merge pull request #2 from sralmai/refactor/extract-http
+- Merge pull request #4 from sralmai/fix/flake-lock-and-darwin
+- Merge pull request #5 from sralmai/fix/harnesses-grok-bot
+- Merge pull request #7 from sralmai/design/share-service-alternatives
+- Merge pull request #8 from sralmai/feat/share-server
+- Merge pull request #6 from sralmai/feat/share-backend-design
+- Merge pull request #9 from sralmai/feat/deploy-layout
+- Merge pull request #11 from sralmai/feat/share-client
+- Merge pull request #15 from sralmai/feat/minio-to-pgsty-silo
+
+### Fixed
+
+- Correct Windows editor invocation, window detection, and target validation ([#30](https://github.com/skillsynchq/txcript/pull/30))
+- Enforce containment and path validation on delete across file-backed stores ([#36](https://github.com/skillsynchq/txcript/pull/36))
+- Discover archived conversations ([#53](https://github.com/skillsynchq/txcript/pull/53))
+- Commit the lockfile and drop a deprecated stdenv call
+- List grok_bot in the harnesses help string
+- Close ten review findings across the core and the store seams
+- Work through the review findings on the share service ([#19](https://github.com/skillsynchq/txcript/pull/19))
+- A refused store operation is not an outage ([#23](https://github.com/skillsynchq/txcript/pull/23))
+
 ## [0.14.4](https://github.com/skillsynchq/txcript/compare/v0.14.3...v0.14.4) - 2026-09-13
 
 ### Fixed
