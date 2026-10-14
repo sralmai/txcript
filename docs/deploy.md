@@ -333,7 +333,8 @@ deployment cannot enumerate the others.
 
 What it prints is an **identity** policy: it carries no `Principal` and is
 attached to the user, role or token that publishes — `aws iam put-user-policy`
-on AWS, an API token's permissions on R2. It is not a bucket policy, and
+on AWS. R2 is not IAM and an ordinary R2 token cannot carry it; see
+[R2 is not IAM](#r2-is-not-iam) below. It is not a bucket policy, and
 `put-bucket-policy` rejects it for the missing `Principal`. Permissions belong
 to the publisher here rather than to the bucket, because each publisher gets a
 different prefix.
@@ -355,6 +356,103 @@ backend tells you so by name rather than reporting an empty store.
 
 Then `txcript push`, `txcript pull` and `txcript list --from share` work as
 they do against a service.
+
+#### 4. Verify the policy against a real bucket
+
+Everything about `s3-policy` is covered by tests except the thing that
+matters most: whether what it prints is *enough*. A missing action only
+shows up when a **restricted** identity tries to use it, and testing as an
+admin — or against MinIO or Silo, whose policy engines are not IAM — cannot
+show it. Do this once per deployment, against the real provider.
+
+Two publishers are needed, because half of what the policy claims is about
+the second one being refused.
+
+```sh
+BUCKET=my-txcript-bucket
+
+for who in alice bob; do
+  aws iam create-user --user-name txcript-$who
+  txcript s3-policy --bucket $BUCKET --owner $who > /tmp/$who.json
+  aws iam put-user-policy --user-name txcript-$who \
+    --policy-name txcript-share --policy-document file:///tmp/$who.json
+  aws iam create-access-key --user-name txcript-$who
+done
+```
+
+Then, with **only** those keys in the environment — no admin profile, no
+instance role, or the test proves nothing:
+
+1. **Alice publishes, reads back, and lists.** `txcript push <id>`,
+   `txcript pull alice/<id>`, and `txcript list --from share` all succeed.
+   This is the whole happy path on the five calls the store makes:
+   `PutObject`, `GetObject`, `HeadObject`, `DeleteObject`, `ListObjectsV2`.
+2. **Bob reads Alice's transcript.** `txcript pull alice/<id>` as Bob
+   succeeds — "read everything" is real.
+3. **Bob cannot overwrite it.** Publish as Bob with
+   `TXCRIPT_SHARE_OWNER=alice` and the same session id. It must be refused
+   with `AccessDenied` **from AWS**. A client-side refusal does not count:
+   the condition on writes is the only thing enforcing ownership on this
+   path, and nothing in the client is trying to.
+4. **Bob cannot delete it either.** `DeleteObject` is in the same statement
+   and is the one people forget to try. No CLI command reaches it on this
+   path — `DirectStore::delete` is library-only — so check it directly:
+   `aws s3api delete-object --bucket $BUCKET --key alice/<id>` with Bob's
+   keys must be refused.
+5. **Repeat 1–4 with `--prefix`.** Generate with
+   `--prefix prod`, set `TXCRIPT_SHARE_PREFIX=prod`, and confirm listing
+   still works for the deployment the prefix belongs to. The scoped
+   `s3:prefix` condition is the easiest thing here to get subtly wrong: a
+   listing whose prefix does not match it is denied outright, so a
+   disagreement between `--prefix` and `TXCRIPT_SHARE_PREFIX` shows up as
+   `AccessDenied` on every list rather than as a short one.
+6. **Pull something that does not exist.** `txcript pull alice/nope`. See
+   the note below before deciding whether what you get is acceptable.
+
+Anything that turns out to be missing goes into `direct_access_policy` with
+a note saying which call needed it — not into this page, or the two drift.
+
+##### Known rough edge: 403 where the code expects 404
+
+`ListBucket` is granted *conditionally*, on `s3:prefix`. A `GetObject` or
+`HeadObject` request carries no `s3:prefix`, so the condition does not match
+and, for the purposes of the 404-vs-403 rule, the identity does not have
+`ListBucket`. S3 therefore answers **403 `AccessDenied`** for a key that
+simply is not there, where an unrestricted identity would get 404
+`NoSuchKey`.
+
+The store's `is_missing` tests for 404, so under the generated policy a
+missing object reads as a backend error rather than as absence. Two places
+to look at while you are in there:
+
+- `txcript pull <slug>` for a slug that does not exist reports an opaque
+  backend error instead of "no such transcript".
+- A listing that races a delete fails outright. `S3::list` issues one
+  `HeadObject` per entry and is written to skip an entry that vanished
+  underneath it; a 403 is propagated instead of skipped, so the whole
+  `discover` fails rather than dropping one row.
+
+Neither is reachable as an admin, which is why this is written down here
+rather than caught by a test.
+
+##### R2 is not IAM
+
+R2 speaks the S3 API but not IAM, and an ordinary R2 API token scopes to a
+*bucket*, not to a prefix — so the generated policy cannot be attached to
+one, and "write only your own prefix" is not expressible that way. On R2
+either every publisher is trusted with the whole bucket, or credentials come
+from R2's temporary access credentials, which do take a prefix-scoped policy
+document. Check which of those you are relying on before treating ownership
+as enforced; `txcript push` behaves identically either way, which is exactly
+the problem.
+
+##### Encrypted buckets
+
+The policy covers S3 actions only. A bucket with SSE-KMS also needs
+`kms:GenerateDataKey` and `kms:Decrypt` on the key for writes, and
+`kms:Decrypt` for reads; the default SSE-S3 needs nothing extra. Likewise a
+bucket policy that requires a particular `s3:x-amz-server-side-encryption`
+header will refuse these writes, which send none.
 
 #### What you give up
 
