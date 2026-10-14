@@ -75,6 +75,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      # The link the release notes get, from the manifest that was actually
+      # published rather than from a name written down twice.
+      url: ${{ steps.publish.outputs.url }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -94,7 +98,13 @@ jobs:
       # Trusted publishing needs npm >= 11.5.1; Node 24 can bundle older.
       - run: npm install -g npm@latest
       - run: bun run build
-      - run: npm publish --access public --ignore-scripts
+      - id: publish
+        run: |
+          set -eu
+          npm publish --access public --ignore-scripts
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          echo "url=https://www.npmjs.com/package/$name/v/$version" >> "$GITHUB_OUTPUT"
 
   binaries:
     name: Build CLI binaries
@@ -125,9 +135,18 @@ jobs:
       - name: Create release with notes and binaries
         env:
           GH_TOKEN: ${{ github.token }}
+          NPM_URL: ${{ needs.npm.outputs.url }}
         run: |
           set -eu
           ls -R artifacts
+          # One link per package this run actually published. A fork that
+          # skips npm says nothing rather than pointing at a package it does
+          # not own, and there is no crates.io link because there is no
+          # crates.io job.
+          if [ -n "$NPM_URL" ]; then
+            printf '\n---\n\n- npm: %s\n' "$NPM_URL" >> artifacts/release-notes/notes.md
+          fi
+          cat artifacts/release-notes/notes.md
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \

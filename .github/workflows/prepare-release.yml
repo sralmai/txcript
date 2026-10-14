@@ -12,6 +12,17 @@ name: prepare-release
 #
 # Pushes as the release GitHub App, which bypasses the main and tag
 # rulesets and whose pushes trigger workflows (GITHUB_TOKEN's do not).
+#
+# The App is optional. With `RELEASE_APP_ID` unset — a fork — the push falls
+# back to GITHUB_TOKEN, which needs no setup but cannot bypass a ruleset on
+# main, and whose tag push does *not* start release.yml. So the fallback
+# dispatches release.yml itself afterwards: `workflow_dispatch` is one of
+# the two events GitHub always runs, GITHUB_TOKEN or not. A fork therefore
+# needs no secrets at all, as long as main is unprotected.
+#
+# The `release` environment is still where approval lives. An environment
+# referenced but never configured imposes no gate, so a fork that wants the
+# approval button has to add a required reviewer to it.
 on:
   workflow_dispatch:
     inputs:
@@ -75,31 +86,47 @@ jobs:
     # Required reviewer on the environment is the approval step: the plan
     # above is in the run summary when the button appears.
     environment: release
+    permissions:
+      # Both only matter without the App: pushing the release commit, and
+      # then starting release.yml by hand because the push will not.
+      contents: write
+      actions: write
     steps:
       - uses: actions/create-github-app-token@v2
         id: app
+        if: vars.RELEASE_APP_ID != ''
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_KEY }}
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          token: ${{ steps.app.outputs.token }}
+          # Empty when the App step was skipped, and `||` takes the fallback.
+          token: ${{ steps.app.outputs.token || github.token }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: git-cliff@2.14.1
-      - name: Commit as the release App
+      - name: Commit as the release App, or as the Actions bot
         run: |
-          id="$(gh api "/users/${{ steps.app.outputs.app-slug }}[bot]" --jq .id)"
-          git config user.name '${{ steps.app.outputs.app-slug }}[bot]'
-          git config user.email "${id}+${{ steps.app.outputs.app-slug }}[bot]@users.noreply.github.com"
+          set -eu
+          if [ -n "$APP_SLUG" ]; then
+            id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+            git config user.name "${APP_SLUG}[bot]"
+            git config user.email "${id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          fi
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
       - name: Build the release commit and push it with its tag
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
         run: |
           set -eu
           tag="v$VERSION"
@@ -125,6 +152,13 @@ jobs:
             git tag -a "$tag" -m "$tag"
             if git push --atomic origin HEAD:main "refs/tags/$tag"; then
               echo "pushed $tag on $(git rev-parse --short HEAD) (attempt $attempt)"
+              # The App's push starts release.yml on its own. GITHUB_TOKEN's
+              # does not — that is the recursion guard — so the fallback has
+              # to ask for the run, on the tag it just pushed.
+              if [ -z "$APP_SLUG" ]; then
+                gh workflow run release.yml --ref "$tag"
+                echo "dispatched release.yml on $tag"
+              fi
               exit 0
             fi
             echo "main moved during attempt $attempt; rebuilding on the new head"
