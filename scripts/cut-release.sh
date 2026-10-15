@@ -47,6 +47,10 @@ for arg in "$@"; do
   esac
 done
 
+# The repository that owns the published package names. A fork is anything
+# else, and has to opt out of the npm publish before it can release.
+UPSTREAM=skillsynchq/txcript
+
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
 
@@ -115,6 +119,22 @@ if [ "${CI:-}" != "true" ]; then
     echo "warning: the latest ci run on main is '${state:-unknown}', not success" >&2
     assume_yes=false
   fi
+
+  # A fork that has not opted out of the npm publish watches release.yml
+  # fail on a package name it does not own — and by then the tag is pushed.
+  # Not fatal: the opt-out may be unreadable with this token, and being
+  # wrong about it should not block a release.
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || echo '')"
+  if [ -n "$repo" ] && [ "$repo" != "$UPSTREAM" ]; then
+    optout="$(gh variable get PUBLISH_NPM --json value --jq .value 2>/dev/null || echo '?')"
+    if [ "$optout" != false ]; then
+      echo "warning: $repo is not $UPSTREAM and PUBLISH_NPM is '${optout}', not 'false'." >&2
+      echo "         The npm job will try to publish a name this fork may not own," >&2
+      echo "         and a failed publish blocks the GitHub Release." >&2
+      echo "         Set it with: gh variable set PUBLISH_NPM --body false" >&2
+      assume_yes=false
+    fi
+  fi
 fi
 
 resolve_version
@@ -124,7 +144,18 @@ tag="v$version"
 
 git-cliff --unreleased --tag "$tag" --strip all 2>/dev/null > /tmp/cut-release-section.$$ \
   || die "git-cliff could not generate the changelog section"
-[ -s /tmp/cut-release-section.$$ ] || die "there is nothing to release since the last tag"
+
+# Not `-s`: with nothing to release git-cliff still writes the `## [x.y.z]`
+# heading, so a non-empty file proves nothing. An empty section is cut
+# happily, lands a tag, and then fails release.yml at "CHANGELOG.md has no
+# section for x.y.z" — after the tag is pushed and irreversible. Count the
+# entries instead.
+entries="$(grep -vcE '^(## \[|[[:space:]]*$)' /tmp/cut-release-section.$$ || true)"
+if [ "${entries:-0}" -eq 0 ]; then
+  rm -f /tmp/cut-release-section.$$
+  die "nothing has landed since the last tag, so the release section would be
+empty and release.yml would reject the tag. Merge something first."
+fi
 
 say "Release $tag from $(git rev-parse --short HEAD)"
 echo
