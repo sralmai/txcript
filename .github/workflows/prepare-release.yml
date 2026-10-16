@@ -51,7 +51,7 @@ jobs:
           fetch-depth: 0
       - uses: taiki-e/install-action@v2
         with:
-          tool: git-cliff@2.14.1
+          tool: git-cliff@2.14.2
       - name: Resolve version
         id: version
         env:
@@ -101,7 +101,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: git-cliff@2.14.1
+          tool: git-cliff@2.14.2
       - name: Commit as the release App, or as the Actions bot
         run: |
           set -eu
